@@ -1,22 +1,21 @@
 import json
 import os
 import time
-from deep_translator import GoogleTranslator
 import requests
 
 # --- КОНФІГУРАЦІЯ ---
 CONGRESS_API_KEY = os.getenv("CONGRESS_API_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+GEMINI_API_KEY = os.getenv(
+    "GEMINI_API_KEY"
+)  # Опціонально, для супер-перекладу
 
 if not all([CONGRESS_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
-    raise ValueError("Помилка: Не всі секретні ключі знайдені у змінних оточення!")
+    raise ValueError("Помилка: Не всі обов'язкові ключі знайдені у секретах!")
 
 DB_FILE = "processed_bills.json"
 BASE_URL = "https://api.congress.gov/v3"
-
-# Ініціалізація перекладача (з англійської на українську)
-translator = GoogleTranslator(source="en", target="uk")
 
 
 def load_processed_bills():
@@ -31,13 +30,51 @@ def save_processed_bills(processed_set):
         json.dump(list(processed_set), f, ensure_ascii=False, indent=2)
 
 
+def translate_with_gemini(text):
+    """Використовує Gemini API для якісного перекладу та адаптації."""
+    if not GEMINI_API_KEY or not text:
+        return text
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": f"Переклади цей офіційний американський законопроєкт або статус українською мовою. Зроби це професійно, у стилі політичної аналітики. Поверни ТІЛЬКИ перекладений текст без жодних додаткових пояснень:\n\n{text}"
+                    }
+                ]
+            }
+        ]
+    }
+    headers = {"Content-Type": "application/json"}
+
+    try:
+        response = requests.post(
+            url, json=payload, headers=headers, timeout=15
+        )
+        if response.status_code == 200:
+            result = response.json()
+            translated = (
+                result.get("candidates", [{}])[0]
+                .get("content", {})
+                .get("parts", [{}])[0]
+                .get("text", "")
+                .strip()
+            )
+            return translated if translated else text
+    except Exception as e:
+        print(f"Помилка перекладу через Gemini: {e}")
+
+    return text
+
+
 def is_target_bill(title):
     """Фільтрує законопроєкти за ключовими словами (відсікає сміття)."""
     if not title:
         return False
 
     title_lower = title.lower()
-
     stop_words = [
         "postal service",
         "post office",
@@ -85,7 +122,7 @@ def run_tracker():
     params = {
         "api_key": CONGRESS_API_KEY,
         "format": "json",
-        "limit": 15,
+        "limit": 10,
         "sort": "updateDate+desc",
     }
 
@@ -134,16 +171,9 @@ def run_tracker():
                 "actionDate", item.get("updateDate", "Невідомо")
             )
 
-            # Переклад англійських текстів українською
-            try:
-                uk_title = translator.translate(title) or title
-            except Exception:
-                uk_title = title
-
-            try:
-                uk_action_text = translator.translate(action_text) or action_text
-            except Exception:
-                uk_action_text = action_text
+            # Переклад через Gemini API
+            uk_title = translate_with_gemini(title)
+            uk_action_text = translate_with_gemini(action_text)
 
             chamber_path = (
                 "house-bill" if bill_type == "HR" else "senate-bill"
