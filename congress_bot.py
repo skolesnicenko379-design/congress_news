@@ -1,7 +1,7 @@
 import json
 import os
 import time
-from deep_translator import GoogleTranslator
+from deep_translator import MyMemoryTranslator
 import requests
 
 # --- КОНФІГУРАЦІЯ ---
@@ -15,8 +15,8 @@ if not all([CONGRESS_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
 DB_FILE = "processed_bills.json"
 BASE_URL = "https://api.congress.gov/v3"
 
-# Ініціалізація стандартного Google Translate
-translator = GoogleTranslator(source="en", target="uk")
+# Використовуємо стабільний на сервері перекладач MyMemory
+translator = MyMemoryTranslator(source="en", target="uk")
 
 
 def load_processed_bills():
@@ -32,14 +32,13 @@ def save_processed_bills(processed_set):
 
 
 def translate_text(text):
-    """Надійний переклад через Google Translate з обробкою довжини."""
+    """Надійний переклад через MyMemory API."""
     if not text:
         return text
     try:
-        # Google Translate має ліміт на довжину тексту (5000 символів),
-        # але назви законів короткі, тому ріжемо лише на випадок надто довгих статусів
-        if len(text) > 4000:
-            text = text[:4000]
+        # MyMemory приймає до 500 символів за раз, тому розбиваємо довгі статуси якщо потрібно
+        if len(text) > 450:
+            text = text[:450]
 
         translated = translator.translate(text)
         return translated if translated else text
@@ -150,7 +149,7 @@ def run_tracker():
                 "actionDate", item.get("updateDate", "Невідомо")
             )
 
-            # Переклад через стандартний Google Translate
+            # Стабільний переклад українською
             uk_title = translate_text(title)
             uk_action_text = translate_text(action_text)
 
