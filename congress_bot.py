@@ -10,12 +10,12 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 if not all([CONGRESS_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
-    raise ValueError("Помилка: Не всі секретні ключі знайдені у змінних оточення!")
+    raise ValueError("Помилка: Не всі обов'язкові ключі знайдені у секретах!")
 
 DB_FILE = "processed_bills.json"
 BASE_URL = "https://api.congress.gov/v3"
 
-# Ініціалізація перекладача (з англійської на українську)
+# Ініціалізація стандартного Google Translate
 translator = GoogleTranslator(source="en", target="uk")
 
 
@@ -31,13 +31,29 @@ def save_processed_bills(processed_set):
         json.dump(list(processed_set), f, ensure_ascii=False, indent=2)
 
 
+def translate_text(text):
+    """Надійний переклад через Google Translate з обробкою довжини."""
+    if not text:
+        return text
+    try:
+        # Google Translate має ліміт на довжину тексту (5000 символів),
+        # але назви законів короткі, тому ріжемо лише на випадок надто довгих статусів
+        if len(text) > 4000:
+            text = text[:4000]
+
+        translated = translator.translate(text)
+        return translated if translated else text
+    except Exception as e:
+        print(f"Помилка перекладу: {e}")
+        return text
+
+
 def is_target_bill(title):
     """Фільтрує законопроєкти за ключовими словами (відсікає сміття)."""
     if not title:
         return False
 
     title_lower = title.lower()
-
     stop_words = [
         "postal service",
         "post office",
@@ -85,7 +101,7 @@ def run_tracker():
     params = {
         "api_key": CONGRESS_API_KEY,
         "format": "json",
-        "limit": 15,
+        "limit": 10,
         "sort": "updateDate+desc",
     }
 
@@ -134,16 +150,9 @@ def run_tracker():
                 "actionDate", item.get("updateDate", "Невідомо")
             )
 
-            # Переклад англійських текстів українською
-            try:
-                uk_title = translator.translate(title) or title
-            except Exception:
-                uk_title = title
-
-            try:
-                uk_action_text = translator.translate(action_text) or action_text
-            except Exception:
-                uk_action_text = action_text
+            # Переклад через стандартний Google Translate
+            uk_title = translate_text(title)
+            uk_action_text = translate_text(action_text)
 
             chamber_path = (
                 "house-bill" if bill_type == "HR" else "senate-bill"
