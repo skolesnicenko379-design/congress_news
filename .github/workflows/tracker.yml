@@ -1,0 +1,37 @@
+name: Congress Bill Tracker
+
+on:
+  schedule:
+    - cron: '0 * * * *' # Запуск раз на годину
+  workflow_dispatch: # Дозволяє запускати вручну кнопкою
+
+jobs:
+  run-tracker:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Завантаження репозиторію
+        uses: actions/checkout@v3
+
+      - name: Встановлення Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Встановлення залежностей
+        run: pip install requests python-dotenv
+
+      - name: Запуск парсера
+        env:
+          CONGRESS_API_KEY: ${{ secrets.CONGRESS_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python congress_bot.py
+
+      - name: Збереження бази оброблених документів
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add processed_bills.json
+          git diff --quiet && git diff --staged --quiet || git commit -m "Update processed bills DB"
+          git push
