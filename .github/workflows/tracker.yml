@@ -22,7 +22,7 @@ jobs:
           python-version: '3.x'
 
       - name: Встановлення залежностей
-        run: pip install requests python-dotenv
+        run: pip install requests python-dotenv deep-translator
 
       - name: Запуск парсера
         env:
