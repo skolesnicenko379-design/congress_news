@@ -1,7 +1,6 @@
 import json
 import os
 import time
-from deep_translator import MyMemoryTranslator
 import requests
 
 # --- КОНФІГУРАЦІЯ ---
@@ -14,9 +13,6 @@ if not all([CONGRESS_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
 
 DB_FILE = "processed_bills.json"
 BASE_URL = "https://api.congress.gov/v3"
-
-# Використовуємо стабільний на сервері перекладач MyMemory
-translator = MyMemoryTranslator(source="en", target="uk")
 
 
 def load_processed_bills():
@@ -32,19 +28,22 @@ def save_processed_bills(processed_set):
 
 
 def translate_text(text):
-    """Надійний переклад через MyMemory API."""
+    """Прямий і стабільний переклад через публічний API Google Translate."""
     if not text:
         return text
     try:
-        # MyMemory приймає до 500 символів за раз, тому розбиваємо довгі статуси якщо потрібно
-        if len(text) > 450:
-            text = text[:450]
-
-        translated = translator.translate(text)
-        return translated if translated else text
+        url = "https://translate.googleapis.com/translate_a/single"
+        params = {"client": "gtx", "sl": "en", "tl": "uk", "dt": "t", "q": text}
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            res_json = response.json()
+            translated_sentence = "".join(
+                [item[0] for item in res_json[0] if item[0]]
+            )
+            return translated_sentence if translated_sentence else text
     except Exception as e:
         print(f"Помилка перекладу: {e}")
-        return text
+    return text
 
 
 def is_target_bill(title):
@@ -149,7 +148,7 @@ def run_tracker():
                 "actionDate", item.get("updateDate", "Невідомо")
             )
 
-            # Стабільний переклад українською
+            # Переклад українською
             uk_title = translate_text(title)
             uk_action_text = translate_text(action_text)
 
