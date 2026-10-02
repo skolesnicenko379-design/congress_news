@@ -1,183 +1,117 @@
-import json
 import os
-import time
+import json
 import requests
+from datetime import datetime, timezone, timedelta
 
-# --- КОНФІГУРАЦІЯ ---
-CONGRESS_API_KEY = os.getenv("CONGRESS_API_KEY")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHANNEL_ID")
+API_KEY = os.getenv("CONGRESS_API_KEY")
 
-if not all([CONGRESS_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
-    raise ValueError("Помилка: Не всі обов'язкові ключі знайдені у секретах!")
+STATE_FILE = "processed_bills.json"
 
-DB_FILE = "processed_bills.json"
-BASE_URL = "https://api.congress.gov/v3"
+def get_current_congress():
+    """Математично точне визначення Конгресу (з урахуванням зміни 3 січня непарних років)"""
+    now = datetime.now()
+    year = now.year
+    
+    # Якщо це непарний рік, але ще не настало 3 січня — працює попереднє скликання
+    if year % 2 != 0 and (now.month == 1 and now.day < 3):
+        effective_year = year - 1
+    else:
+        effective_year = year
+        
+    # Формула: (Поточний рік - Рік першого Конгресу) // 2 + 1
+    congress_number = (effective_year - 1789) // 2 + 1
+    
+    return str(congress_number)
 
+def load_processed():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
 
-def load_processed_bills():
-    if os.path.exists(DB_FILE):
-        with open(DB_FILE, "r", encoding="utf-8") as f:
-            return set(json.load(f))
-    return set()
+def save_processed(processed):
+    # Зберігаємо останні 100 унікальних ID, щоб файл не роздувався
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(processed[-100:], f, ensure_ascii=False, indent=2)
 
+def fetch_recent_bills():
+    current_congress = get_current_congress()
+    print(f"Поточний визначений Конгрес: {current_congress}")
+    
+    url = f"https://api.congress.gov/v3/bill/{current_congress}?api_key={API_KEY}&limit=25&sort=updateDate:desc"
+    response = requests.get(url)
+    
+    if response.status_code != 200:
+        print(f"Помилка API Конгресу: {response.status_code}")
+        return []
+        
+    data = response.json()
+    bills = data.get("bills", [])
+    
+    recent_bills = []
+    # Межа — 24 години тому
+    one_day_ago = datetime.now(timezone.utc) - timedelta(hours=24)
+    
+    for bill in bills:
+        update_date_str = bill.get("updateDate")
+        if not update_date_str:
+            continue
+            
+        # Парсимо дату оновлення від API
+        try:
+            bill_date = datetime.fromisoformat(update_date_str.replace("Z", "+00:00"))
+        except Exception:
+            continue
+            
+        # Суворий фільтр: тільки те, що оновлювалося за останні 24 години
+        if bill_date >= one_day_ago:
+            bill_id = f"{bill['congress']}_{bill['type']}_{bill['number']}"
+            recent_bills.append({
+                "id": bill_id,
+                "congress": bill["congress"],
+                "type": bill["type"].upper(),
+                "number": bill["number"],
+                "title": bill.get("title", "Без назви"),
+                "url": bill.get("url", ""),
+                "updateDate": update_date_str
+            })
+            
+    return recent_bills
 
-def save_processed_bills(processed_set):
-    with open(DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(list(processed_set), f, ensure_ascii=False, indent=2)
-
-
-def translate_text(text):
-    """Прямий і стабільний переклад через публічний API Google Translate."""
-    if not text:
-        return text
-    try:
-        url = "https://translate.googleapis.com/translate_a/single"
-        params = {"client": "gtx", "sl": "en", "tl": "uk", "dt": "t", "q": text}
-        response = requests.get(url, params=params, timeout=10)
-        if response.status_code == 200:
-            res_json = response.json()
-            translated_sentence = "".join(
-                [item[0] for item in res_json[0] if item[0]]
-            )
-            return translated_sentence if translated_sentence else text
-    except Exception as e:
-        print(f"Помилка перекладу: {e}")
-    return text
-
-
-def is_target_bill(title):
-    """Фільтрує законопроєкти за ключовими словами (відсікає сміття)."""
-    if not title:
-        return False
-
-    title_lower = title.lower()
-    stop_words = [
-        "postal service",
-        "post office",
-        "commemorative coin",
-        "to designate the facility",
-        "to rename",
-        "for the relief of",
-        "to redesignate",
-        "mint coins",
-    ]
-    if any(sw in title_lower for sw in stop_words):
-        return False
-
-    return True
-
-
-def get_bill_details(congress, bill_type, bill_number):
-    url = f"{BASE_URL}/bill/{congress}/{bill_type.lower()}/{bill_number}"
-    params = {"api_key": CONGRESS_API_KEY, "format": "json"}
-    try:
-        res = requests.get(url, params=params, timeout=15)
-        if res.status_code == 200:
-            return res.json().get("bill", {})
-    except Exception as e:
-        print(f"Помилка отримання деталей {bill_type}{bill_number}: {e}")
-    return {}
-
-
-def send_telegram_message(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+def send_telegram(text):
+    if not TOKEN or not CHAT_ID:
+        print("Telegram токен або ID каналу не налаштовані!")
+        return
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": CHAT_ID,
         "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
+        "parse_mode": "Markdown",
+        "disable_web_page_preview": True
     }
-    response = requests.post(url, json=payload, timeout=15)
-    return response.status_code == 200
-
-
-def run_tracker():
-    print("Запуск перевірки Congress API...")
-    processed_bills = load_processed_bills()
-
-    params = {
-        "api_key": CONGRESS_API_KEY,
-        "format": "json",
-        "limit": 10,
-        "sort": "updateDate+desc",
-    }
-
-    try:
-        response = requests.get(f"{BASE_URL}/bill", params=params, timeout=15)
-        if response.status_code != 200:
-            print(f"Помилка Congress API: {response.status_code}")
-            return
-
-        data = response.json()
-        bills = data.get("bills", [])
-
-        for item in reversed(bills):
-            bill_type = item.get("type", "").upper()
-
-            if bill_type not in ["HR", "S"]:
-                continue
-
-            congress = item.get("congress")
-            number = item.get("number")
-            bill_id = f"{congress}_{bill_type}_{number}"
-
-            if bill_id in processed_bills:
-                continue
-
-            details = get_bill_details(congress, bill_type, number)
-            title = details.get("title") or item.get("title", "Без назви")
-
-            # Фільтруємо сміття
-            if not is_target_bill(title):
-                processed_bills.add(bill_id)
-                save_processed_bills(processed_bills)
-                print(f"Відфільтровано: {bill_id}")
-                continue
-
-            sponsors = details.get("sponsors", [])
-            sponsor_name = (
-                f"{sponsors[0].get('fullName')} ({sponsors[0].get('party')}-{sponsors[0].get('state')})"
-                if sponsors
-                else "Не вказано"
-            )
-
-            latest_action = details.get("latestAction", {})
-            action_text = latest_action.get("text", "Внесено")
-            action_date = latest_action.get(
-                "actionDate", item.get("updateDate", "Невідомо")
-            )
-
-            # Переклад українською
-            uk_title = translate_text(title)
-            uk_action_text = translate_text(action_text)
-
-            chamber_path = (
-                "house-bill" if bill_type == "HR" else "senate-bill"
-            )
-            bill_url = f"https://www.congress.gov/bill/{congress}th-congress/{chamber_path}/{number}"
-            chamber_name = (
-                "Палата представників" if bill_type == "HR" else "Сенат"
-            )
-
-            post = (
-                f"🇺🇸 <b>Новий законопроєкт</b>\n\n"
-                f"<b>Документ:</b> {bill_type}.{number} ({chamber_name})\n"
-                f"<b>Спонсор:</b> {sponsor_name}\n"
-                f"<b>Статус ({action_date}):</b> {uk_action_text}\n\n"
-                f"<b>Суть:</b> {uk_title}\n\n"
-                f"🔗 <a href='{bill_url}'>Посилання на документ</a>"
-            )
-
-            if send_telegram_message(post):
-                print(f"Опубліковано: {bill_id}")
-                processed_bills.add(bill_id)
-                save_processed_bills(processed_bills)
-                time.sleep(2)
-
-    except Exception as e:
-        print(f"Помилка: {e}")
-
+    requests.post(url, json=payload)
 
 if __name__ == "__main__":
-    run_tracker()
+    processed = load_processed()
+    new_bills = fetch_recent_bills()
+    
+    sent_count = 0
+    for bill in new_bills:
+        if bill["id"] not in processed:
+            message = (
+                f"🇺🇸 *Оновлення в Конгресі США ({bill['congress']}-е скликання)*\n\n"
+                f"📌 *{bill['type']} {bill['number']}*\n"
+                f"{bill['title']}\n\n"
+                f"🕒 Оновлено: `{bill['updateDate']}`"
+            )
+            send_telegram(message)
+            processed.append(bill["id"])
+            sent_count += 1
+            
+    save_processed(processed)
+    print(f"Успішно оброблено нових законопроєктів за добу: {sent_count}")
