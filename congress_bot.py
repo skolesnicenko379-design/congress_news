@@ -55,7 +55,7 @@ def fetch_recent_bills():
     
     recent_bills = []
     # Межа — 24 години тому (UTC)
-    one_day_ago = datetime.now(timezone.utc) - timedelta(hours=24)
+    one_day_ago = datetime.now(timezone.utc) - timedelta(days=14)
     
     for bill in bills:
         update_date_str = bill.get("updateDate")
