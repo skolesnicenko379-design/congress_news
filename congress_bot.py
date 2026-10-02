@@ -13,7 +13,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip(" .")
 STATE_FILE = "processed_bills.json"
 
 def get_best_model():
-    """Динамічно отримує список активних моделей від Groq і обирає найнадійнішу"""
+    """Фільтрує список і обирає виключно робочі текстові моделі (Llama, Mixtral, Gemma)"""
     url = "https://api.groq.com/openai/v1/models"
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
     
@@ -21,26 +21,34 @@ def get_best_model():
         res = requests.get(url, headers=headers, timeout=5)
         if res.status_code == 200:
             models = [m["id"] for m in res.json().get("data", [])]
-            print(f"Доступні моделі на сервері Groq: {models}")
+            print(f"Усі доступні моделі на сервері Groq: {models}")
             
-            # Пріоритет актуальних легких та швидких моделей
-            for preferred in ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "gemma2-9b-it"]:
-                if preferred in models:
-                    print(f"Обрано модель: {preferred}")
-                    return preferred
+            # Жорсткий список бажаних текстових моделей
+            priorities = [
+                "llama-3.1-8b-instant",
+                "llama-3.3-70b-versatile",
+                "llama-3.1-70b-versatile",
+                "gemma2-9b-it",
+                "mixtral-8x7b-32768"
+            ]
+            
+            for p in priorities:
+                if p in models:
+                    print(f"Обрано пріоритетну модель: {p}")
+                    return p
                     
-            # Якщо є будь-яка інша llama-3
+            # Якщо пріоритетних немає, шукаємо будь-яку llama, gemma або mixtral, уникаючи аудіо/транскрипції/vision
             for m in models:
-                if "llama-3" in m.lower() and "vision" not in m.lower():
-                    print(f"Обрано альтернативну Llama: {m}")
+                m_lower = m.lower()
+                if any(x in m_lower for x in ["whisper", "audio", "vision", "orpheus", "embed"]):
+                    continue
+                if any(x in m_lower for x in ["llama", "gemma", "mixtral", "mistral"]):
+                    print(f"Обрано текстову модель за фільтром: {m}")
                     return m
-                    
-            if models:
-                return models[0]
     except Exception as e:
         print(f"Не вдалося отримати список моделей динамічно: {e}")
         
-    # Залізобетонний актуальний фоллбек
+    # Залізобетонний фоллбек на випадок збою мережі
     return "llama-3.1-8b-instant"
 
 def get_current_congress():
@@ -91,7 +99,7 @@ def process_with_ai(title, status_en, summary_en):
         "model": model_name,
         "messages": [{"role": "user", "content": ai_prompt}],
         "temperature": 0.2,
-        "response_format": {"type": "json_object"}  # ЖОРСТКО ВИМАГАЄМО JSON
+        "response_format": {"type": "json_object"}
     }
 
     try:
