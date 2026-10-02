@@ -12,6 +12,37 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip(" .")
 
 STATE_FILE = "processed_bills.json"
 
+def get_best_model():
+    """Динамічно отримує список активних моделей від Groq і обирає найнадійнішу"""
+    url = "https://api.groq.com/openai/v1/models"
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+    
+    try:
+        res = requests.get(url, headers=headers, timeout=5)
+        if res.status_code == 200:
+            models = [m["id"] for m in res.json().get("data", [])]
+            print(f"Доступні моделі на сервері Groq: {models}")
+            
+            # Пріоритет актуальних легких та швидких моделей
+            for preferred in ["llama-3.1-8b-instant", "llama-3.3-70b-versatile", "gemma2-9b-it"]:
+                if preferred in models:
+                    print(f"Обрано модель: {preferred}")
+                    return preferred
+                    
+            # Якщо є будь-яка інша llama-3
+            for m in models:
+                if "llama-3" in m.lower() and "vision" not in m.lower():
+                    print(f"Обрано альтернативну Llama: {m}")
+                    return m
+                    
+            if models:
+                return models[0]
+    except Exception as e:
+        print(f"Не вдалося отримати список моделей динамічно: {e}")
+        
+    # Залізобетонний актуальний фоллбек
+    return "llama-3.1-8b-instant"
+
 def get_current_congress():
     now = datetime.now()
     year = now.year
@@ -39,6 +70,8 @@ def process_with_ai(title, status_en, summary_en):
     if not GROQ_API_KEY:
         return title, status_en, "Помилка: Ключ GROQ_API_KEY не знайдено."
         
+    model_name = get_best_model()
+        
     ai_prompt = f"""Ти — професійний політичний аналітик. Переклади та поясни законопроєкт Конгресу США.
 Назва: {title}
 Статус: {status_en}
@@ -57,7 +90,7 @@ def process_with_ai(title, status_en, summary_en):
         "Content-Type": "application/json"
     }
     payload = {
-        "model": "mixtral-8x7b-32768", # ВАЖЛИВО: Надійна і завжди доступна модель
+        "model": model_name,
         "messages": [{"role": "user", "content": ai_prompt}],
         "temperature": 0.2
     }
