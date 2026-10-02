@@ -3,8 +3,9 @@ import json
 import requests
 from datetime import datetime, timezone, timedelta
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHANNEL_ID")
+# ТЕПЕР ЗМІННІ ЗБІГАЮТЬСЯ З WORKFLOW.YML
+TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 API_KEY = os.getenv("CONGRESS_API_KEY")
 
 STATE_FILE = "processed_bills.json"
@@ -43,13 +44,12 @@ def fetch_recent_bills():
     current_congress = get_current_congress()
     print(f"Поточний визначений Конгрес: {current_congress}")
     
-    url = f"https://api.congress.gov/v3/bill/{current_congress}"
+    # Вшиваємо сортування прямо в URL, щоб уникнути багів з кодуванням знака "+"
+    url = f"https://api.congress.gov/v3/bill/{current_congress}?sort=updateDate+desc"
     
-    # Правильне передавання параметрів для запиту
     params = {
         "api_key": API_KEY,
-        "limit": 25,
-        "sort": "updateDate+desc"
+        "limit": 25
     }
     
     response = requests.get(url, params=params)
@@ -62,7 +62,7 @@ def fetch_recent_bills():
     bills = data.get("bills", [])
     
     recent_bills = []
-    # Залишаємо 30 днів для перевірки. Коли запрацює — зміниш на hours=24
+    # Залишаємо 30 днів для перевірки. Коли переконаєшся, що все працює — зміни на hours=24
     one_day_ago = datetime.now(timezone.utc) - timedelta(days=30)
     
     print(f"Отримано {len(bills)} законопроєктів від API. Аналізуємо дати...")
