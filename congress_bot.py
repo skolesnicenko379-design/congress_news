@@ -3,14 +3,13 @@ import json
 import requests
 import re
 from datetime import datetime, timezone, timedelta
-from deep_translator import GoogleTranslator
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 API_KEY = os.getenv("CONGRESS_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 STATE_FILE = "processed_bills.json"
-translator = GoogleTranslator(source='en', target='uk')
 
 def get_current_congress():
     now = datetime.now()
@@ -22,7 +21,6 @@ def get_current_congress():
     return str((effective_year - 1789) // 2 + 1)
 
 def is_technical(title):
-    """Фільтрує технічні закони та дрібні резолюції"""
     t = title.lower()
     stop_words = [
         "post office", "postal service", "technical correction",
@@ -33,12 +31,53 @@ def is_technical(title):
     return any(phrase in t for phrase in stop_words)
 
 def escape_md(text):
-    """Очищає текст від спецсимволів, щоб не зламати розмітку Telegram"""
     if not text: return ""
     return text.replace('*', '').replace('_', '').replace('`', '').replace('[', '(').replace(']', ')')
 
+def process_with_ai(title, status_en, summary_en):
+    """Використовує Groq (Llama 3.1) для перекладу та аналізу суті закону"""
+    if not GROQ_API_KEY:
+        print("ПОМИЛКА: Немає GROQ_API_KEY! Передаємо оригінали.")
+        return title, status_en, "Переклад неможливий через відсутність ключа Groq."
+        
+    ai_prompt = f"""Ти — професійний політичний аналітик. Переклади та поясни законопроєкт Конгресу США.
+Назва: {title}
+Статус: {status_en}
+Офіційне резюме: {summary_en if summary_en else 'Відсутнє.'}
+
+Поверни виключно JSON об'єкт з трьома ключами:
+1. "title_uk" - точний переклад назви.
+2. "status_uk" - точний переклад статусу (наприклад "Передано до Комітету з фінансів").
+3. "summary_uk" - коротке і чітке пояснення українською (1-2 речення), про що цей закон і навіщо він потрібен. Якщо "Офіційне резюме" відсутнє, зроби логічний висновок самостійно на основі назви.
+
+Не пиши нічого крім JSON."""
+
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "llama-3.1-8b-instant",
+        "messages": [{"role": "user", "content": ai_prompt}],
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"}
+    }
+
+    try:
+        res = requests.post(url, headers=headers, json=payload)
+        if res.status_code == 200:
+            data = res.json()["choices"][0]["message"]["content"]
+            result = json.loads(data)
+            return result.get("title_uk", title), result.get("status_uk", status_en), result.get("summary_uk", "Не вдалося згенерувати опис.")
+        else:
+            print(f"Помилка Groq API: {res.text}")
+    except Exception as e:
+        print(f"Помилка обробки ШІ: {e}")
+        
+    return title, status_en, "Переклад тимчасово недоступний через помилку ШІ."
+
 def get_public_url(congress, bill_type, number):
-    """Генерує пряме посилання на сайт Конгресу (а не на API)"""
     type_map = {
         "hr": "house-bill", "s": "senate-bill",
         "hjres": "house-joint-resolution", "sjres": "senate-joint-resolution",
@@ -49,35 +88,29 @@ def get_public_url(congress, bill_type, number):
     return f"https://www.congress.gov/bill/{congress}th-congress/{full_type}/{number}"
 
 def get_bill_details(congress, b_type, number):
-    """Робить додаткові запити, щоб отримати ініціатора, статус та резюме"""
     sponsor = "Невідомо"
     status_en = "Introduced"
     summary_en = ""
     
-    # 1. Отримуємо ініціатора та статус
     url = f"https://api.congress.gov/v3/bill/{congress}/{b_type.lower()}/{number}?api_key={API_KEY}"
     res = requests.get(url)
     if res.status_code == 200:
         data = res.json().get("bill", {})
         sponsors = data.get("sponsors", [])
         if sponsors:
-            s = sponsors[0]
-            name = s.get("fullName", "")
-            party = s.get("party", "")
-            state = s.get("state", "")
-            sponsor = f"{name} ({party}-{state})" if party else name
+            sponsor = sponsors[0].get("fullName", "Невідомо")
                 
         action = data.get("latestAction", {}).get("text", "")
         if action:
             status_en = action
             
-    # 2. Отримуємо офіційне резюме (якщо воно вже є)
     url_sum = f"https://api.congress.gov/v3/bill/{congress}/{b_type.lower()}/{number}/summaries?api_key={API_KEY}"
     res_sum = requests.get(url_sum)
     if res_sum.status_code == 200:
         summaries = res_sum.json().get("summaries", [])
         if summaries:
             summary_en = summaries[0].get("text", "")
+            summary_en = re.sub(r'<[^>]+>', '', summary_en)
             
     return sponsor, status_en, summary_en
 
@@ -97,7 +130,7 @@ def save_processed(processed):
 def fetch_recent_bills():
     current_congress = get_current_congress()
     url = f"https://api.congress.gov/v3/bill/{current_congress}?sort=updateDate+desc"
-    params = {"api_key": API_KEY, "limit": 20}
+    params = {"api_key": API_KEY, "limit": 10} # Зменшено для ШІ, щоб не зловити Rate Limit
     
     response = requests.get(url, params=params)
     if response.status_code != 200:
@@ -106,7 +139,7 @@ def fetch_recent_bills():
     bills = response.json().get("bills", [])
     recent_bills = []
     
-    # Змінив на 2 дні (48 годин), щоб ти точно побачив свіжі закони, але не витратив ліміт API
+    # 2 дні для тесту, потім зміни на hours=24
     one_day_ago = datetime.now(timezone.utc) - timedelta(days=2)
     
     for bill in bills:
@@ -136,50 +169,27 @@ if __name__ == "__main__":
     for bill in recent_bills:
         bill_id = f"{bill['congress']}_{bill['type']}_{bill['number']}"
         
-        # Якщо вже відправляли — пропускаємо
         if bill_id in processed:
             continue
             
-        # Якщо це технічний закон про пошту чи монети — позначаємо як оброблений і пропускаємо
-        if is_technical(bill.get("title", "")):
+        if is_technical(bill.get("title", "")) or is_technical(bill.get("latestAction", {}).get("text", "")) :
             processed.append(bill_id)
             continue
             
-        print(f"Обробка нового закону: {bill_id}")
+        print(f"Обробка нового закону через ШІ: {bill_id}")
         
-        # Отримуємо деталі: ініціатора, статус, текст
         sponsor, status_en, summary_en = get_bill_details(bill["congress"], bill["type"], bill["number"])
+        title_uk, status_uk, desc_uk = process_with_ai(bill["title"], status_en, summary_en)
         
-        # Робимо переклад
-        try:
-            title_uk = escape_md(translator.translate(bill["title"]))
-            status_uk = escape_md(translator.translate(status_en))
-            
-            if summary_en:
-                # Очищаємо від HTML-тегів (наприклад <p>)
-                clean_sum = re.sub(r'<[^>]+>', '', summary_en)
-                # Беремо перші два речення для короткого викладу
-                sentences = clean_sum.split('. ')
-                short_sum = '. '.join(sentences[:2]) + '.' if len(sentences) > 1 else clean_sum
-                desc_uk = escape_md(translator.translate(short_sum))
-            else:
-                desc_uk = "Офіційне резюме ще не опубліковано Конгресом (зазвичай з'являється через кілька днів після внесення)."
-                
-        except Exception as e:
-            print(f"Помилка перекладу: {e}")
-            title_uk = escape_md(bill["title"])
-            status_uk = escape_md(status_en)
-            desc_uk = "Переклад тимчасово недоступний."
-            
         public_url = get_public_url(bill["congress"], bill["type"], bill["number"])
         
         message = (
             f"🇺🇸 *Конгрес США ({bill['congress']}-е скликання)*\n\n"
             f"📌 *{bill['type'].upper()} {bill['number']}*\n"
-            f"*{title_uk}*\n\n"
-            f"👤 *Ініціатор:* {sponsor}\n"
-            f"📜 *Статус:* {status_uk}\n\n"
-            f"💡 *Суть:* {desc_uk}\n\n"
+            f"*{escape_md(title_uk)}*\n\n"
+            f"👤 *Ініціатор:* {escape_md(sponsor)}\n"
+            f"📜 *Статус:* {escape_md(status_uk)}\n\n"
+            f"💡 *Суть:* {escape_md(desc_uk)}\n\n"
             f"🔗 [Оригінал документа]({public_url})"
         )
         
