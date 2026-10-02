@@ -57,7 +57,7 @@ def process_with_ai(title, status_en, summary_en):
         "Content-Type": "application/json"
     }
     payload = {
-        "model": "llama3-8b-8192", # ВАЖЛИВО: Змінили модель на стабільну
+        "model": "mixtral-8x7b-32768", # ВАЖЛИВО: Надійна і завжди доступна модель
         "messages": [{"role": "user", "content": ai_prompt}],
         "temperature": 0.2
     }
