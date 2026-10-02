@@ -2,6 +2,7 @@ import os
 import json
 import requests
 import re
+import time
 from datetime import datetime, timezone, timedelta
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -32,10 +33,10 @@ def is_technical(title):
 
 def escape_md(text):
     if not text: return ""
-    return str(text).replace('*', '').replace('_', '').replace('`', '').replace('[', '(').replace(']', ')')
+    return str(text).replace('*', '').replace('_', '').replace('`', '').replace('[', '(').replace(']', '')
 
 def process_with_ai(title, status_en, summary_en):
-    """Використовує Groq для перекладу. Жорстко очищає форматування від Llama."""
+    """Використовує Groq для перекладу з жорстким вилученням JSON."""
     if not GROQ_API_KEY:
         print("Попередження: Немає GROQ_API_KEY! Передаємо оригінали.")
         return title, status_en, "Переклад неможливий (немає ключа)."
@@ -50,7 +51,7 @@ def process_with_ai(title, status_en, summary_en):
 2. "status_uk" - точний переклад статусу.
 3. "summary_uk" - коротке і чітке пояснення українською (1-2 речення), про що цей закон. Якщо "Офіційне резюме" відсутнє, зроби логічний висновок самостійно на основі назви.
 
-БЕЗ жодних вступних слів, маркдауну чи коментарів. Тільки JSON."""
+БЕЗ жодних вступних слів. Тільки JSON."""
 
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
@@ -60,24 +61,26 @@ def process_with_ai(title, status_en, summary_en):
     payload = {
         "model": "llama-3.1-8b-instant",
         "messages": [{"role": "user", "content": ai_prompt}],
-        "temperature": 0.2,
-        "response_format": {"type": "json_object"}
+        "temperature": 0.2
     }
 
     try:
         res = requests.post(url, headers=headers, json=payload)
         if res.status_code == 200:
             data = res.json()["choices"][0]["message"]["content"]
-            print(f"Відповідь ШІ: {data}")
             
-            data_clean = data.replace("```json", "").replace("```", "").strip()
-            
-            try:
-                result = json.loads(data_clean)
-                return result.get("title_uk", title), result.get("status_uk", status_en), result.get("summary_uk", "Опис відсутній.")
-            except json.JSONDecodeError:
-                print("Помилка парсингу JSON після очистки. ШІ повернув невалідний формат.")
-                return title, status_en, "Помилка форматування опису від ШІ."
+            # Шукаємо виключно те, що у фігурних дужках (ігноруємо будь-який текст від Llama)
+            match = re.search(r'\{[\s\S]*\}', data)
+            if match:
+                data_clean = match.group(0)
+                try:
+                    result = json.loads(data_clean)
+                    return result.get("title_uk", title), result.get("status_uk", status_en), result.get("summary_uk", "Опис відсутній.")
+                except json.JSONDecodeError:
+                    print(f"Помилка парсингу: {data_clean}")
+                    return title, status_en, "Помилка форматування опису від ШІ."
+            else:
+                return title, status_en, "ШІ не повернув JSON формат."
         else:
             print(f"Помилка Groq API ({res.status_code}): {res.text}")
     except Exception as e:
@@ -165,12 +168,9 @@ def fetch_recent_bills():
 
 def send_telegram(text):
     if not TOKEN or not CHAT_ID: 
-        print("Помилка: Немає Telegram токенів!")
         return
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    res = requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True})
-    if res.status_code != 200:
-        print(f"Помилка Telegram API: {res.text}")
+    requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True})
 
 if __name__ == "__main__":
     processed = load_processed()
@@ -187,7 +187,7 @@ if __name__ == "__main__":
             processed.append(bill_id)
             continue
             
-        print(f"Обробка нового закону через ШІ: {bill_id}")
+        print(f"Обробка закону: {bill_id}")
         
         sponsor, status_en, summary_en = get_bill_details(bill["congress"], bill["type"], bill["number"])
         title_uk, status_uk, desc_uk = process_with_ai(bill["title"], status_en, summary_en)
@@ -207,6 +207,9 @@ if __name__ == "__main__":
         send_telegram(message)
         processed.append(bill_id)
         sent_count += 1
+        
+        # Затримка, щоб уникнути блокування від Groq API (Rate Limiting)
+        time.sleep(3)
         
     save_processed(processed)
     print(f"Успішно оброблено та відправлено: {sent_count}")
