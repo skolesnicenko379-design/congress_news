@@ -8,7 +8,8 @@ from datetime import datetime, timezone, timedelta
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 API_KEY = os.getenv("CONGRESS_API_KEY")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# Автоматично видаляємо випадкові пробіли чи крапки з кінця ключа
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip(" .")
 
 STATE_FILE = "processed_bills.json"
 
@@ -31,15 +32,14 @@ def is_technical(title):
     ]
     return any(phrase in t for phrase in stop_words)
 
-def escape_md(text):
+# Використовуємо HTML замість Markdown для уникнення збоїв з дужками
+def escape_html(text):
     if not text: return ""
-    return str(text).replace('*', '').replace('_', '').replace('`', '').replace('[', '(').replace(']', '')
+    return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 def process_with_ai(title, status_en, summary_en):
-    """Використовує Groq для перекладу з жорстким вилученням JSON."""
     if not GROQ_API_KEY:
-        print("Попередження: Немає GROQ_API_KEY! Передаємо оригінали.")
-        return title, status_en, "Переклад неможливий (немає ключа)."
+        return title, status_en, "Помилка: Ключ GROQ_API_KEY не знайдено."
         
     ai_prompt = f"""Ти — професійний політичний аналітик. Переклади та поясни законопроєкт Конгресу США.
 Назва: {title}
@@ -68,25 +68,21 @@ def process_with_ai(title, status_en, summary_en):
         res = requests.post(url, headers=headers, json=payload)
         if res.status_code == 200:
             data = res.json()["choices"][0]["message"]["content"]
-            
-            # Шукаємо виключно те, що у фігурних дужках (ігноруємо будь-який текст від Llama)
             match = re.search(r'\{[\s\S]*\}', data)
             if match:
-                data_clean = match.group(0)
                 try:
-                    result = json.loads(data_clean)
+                    result = json.loads(match.group(0))
                     return result.get("title_uk", title), result.get("status_uk", status_en), result.get("summary_uk", "Опис відсутній.")
-                except json.JSONDecodeError:
-                    print(f"Помилка парсингу: {data_clean}")
-                    return title, status_en, "Помилка форматування опису від ШІ."
-            else:
-                return title, status_en, "ШІ не повернув JSON формат."
+                except:
+                    return title, status_en, "Помилка читання JSON від ШІ."
+            return title, status_en, "ШІ не повернув формат JSON."
         else:
-            print(f"Помилка Groq API ({res.status_code}): {res.text}")
+            # ВАЖЛИВО: Передаємо точну помилку від сервера прямо в Telegram
+            err_msg = res.json().get('error', {}).get('message', res.text)
+            return title, status_en, f"Помилка API ({res.status_code}): {err_msg}"
+            
     except Exception as e:
-        print(f"Помилка обробки ШІ: {e}")
-        
-    return title, status_en, "Помилка генерації опису."
+        return title, status_en, f"Збій з'єднання: {e}"
 
 def get_public_url(congress, bill_type, number):
     type_map = {
@@ -145,7 +141,6 @@ def fetch_recent_bills():
     
     response = requests.get(url, params=params)
     if response.status_code != 200:
-        print(f"Помилка API Конгресу: {response.status_code}")
         return []
         
     bills = response.json().get("bills", [])
@@ -170,7 +165,12 @@ def send_telegram(text):
     if not TOKEN or not CHAT_ID: 
         return
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True})
+    requests.post(url, json={
+        "chat_id": CHAT_ID, 
+        "text": text, 
+        "parse_mode": "HTML", 
+        "disable_web_page_preview": True
+    })
 
 if __name__ == "__main__":
     processed = load_processed()
@@ -194,21 +194,21 @@ if __name__ == "__main__":
         
         public_url = get_public_url(bill["congress"], bill["type"], bill["number"])
         
+        # Використовуємо HTML форматування
         message = (
-            f"🇺🇸 *Конгрес США ({bill['congress']}-е скликання)*\n\n"
-            f"📌 *{bill['type'].upper()} {bill['number']}*\n"
-            f"*{escape_md(title_uk)}*\n\n"
-            f"👤 *Ініціатор:* {escape_md(sponsor)}\n"
-            f"📜 *Статус:* {escape_md(status_uk)}\n\n"
-            f"💡 *Суть:* {escape_md(desc_uk)}\n\n"
-            f"🔗 [Оригінал документа]({public_url})"
+            f"🇺🇸 <b>Конгрес США ({bill['congress']}-е скликання)</b>\n\n"
+            f"📌 <b>{bill['type'].upper()} {bill['number']}</b>\n"
+            f"<b>{escape_html(title_uk)}</b>\n\n"
+            f"👤 <b>Ініціатор:</b> {escape_html(sponsor)}\n"
+            f"📜 <b>Статус:</b> {escape_html(status_uk)}\n\n"
+            f"💡 <b>Суть:</b> {escape_html(desc_uk)}\n\n"
+            f"🔗 <a href='{public_url}'>Оригінал документа</a>"
         )
         
         send_telegram(message)
         processed.append(bill_id)
         sent_count += 1
         
-        # Затримка, щоб уникнути блокування від Groq API (Rate Limiting)
         time.sleep(3)
         
     save_processed(processed)
