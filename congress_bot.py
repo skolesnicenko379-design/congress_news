@@ -138,7 +138,7 @@ def save_processed(processed):
 
 def fetch_recent_bills():
     current_congress = get_current_congress()
-    url = f"[https://api.congress.gov/v3/bill/](https://api.congress.gov/v3/bill/){current_congress}?sort=updateDate+desc"
+    url = f"https://api.congress.gov/v3/bill/{current_congress}?sort=updateDate+desc"
     params = {"api_key": API_KEY, "limit": 10} 
     
     response = requests.get(url, params=params)
