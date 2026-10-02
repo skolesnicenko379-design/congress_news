@@ -43,8 +43,16 @@ def fetch_recent_bills():
     current_congress = get_current_congress()
     print(f"Поточний визначений Конгрес: {current_congress}")
     
-    url = f"https://api.congress.gov/v3/bill/{current_congress}?api_key={API_KEY}&limit=25&sort=updateDate:desc"
-    response = requests.get(url)
+    url = f"https://api.congress.gov/v3/bill/{current_congress}"
+    
+    # Правильне передавання параметрів для запиту
+    params = {
+        "api_key": API_KEY,
+        "limit": 25,
+        "sort": "updateDate+desc"
+    }
+    
+    response = requests.get(url, params=params)
     
     if response.status_code != 200:
         print(f"Помилка API Конгресу: {response.status_code}")
@@ -54,8 +62,10 @@ def fetch_recent_bills():
     bills = data.get("bills", [])
     
     recent_bills = []
-    # Межа — 24 години тому (UTC)
+    # Залишаємо 30 днів для перевірки. Коли запрацює — зміниш на hours=24
     one_day_ago = datetime.now(timezone.utc) - timedelta(days=30)
+    
+    print(f"Отримано {len(bills)} законопроєктів від API. Аналізуємо дати...")
     
     for bill in bills:
         update_date_str = bill.get("updateDate")
@@ -66,14 +76,17 @@ def fetch_recent_bills():
             # Парсимо дату
             bill_date = datetime.fromisoformat(update_date_str.replace("Z", "+00:00"))
             
-            # ВИПРАВЛЕННЯ: Якщо API повернуло "наївну" дату без часового поясу, примусово робимо її UTC
+            # Якщо API повернуло "наївну" дату без часового поясу, примусово робимо її UTC
             if bill_date.tzinfo is None:
                 bill_date = bill_date.replace(tzinfo=timezone.utc)
+                
+            # Виводимо в логи GitHub кожну отриману дату для діагностики
+            print(f"Перевірка: {bill['type']} {bill['number']} | Оновлено: {update_date_str}")
                 
         except Exception:
             continue
             
-        # Суворий фільтр: тільки те, що оновлювалося за останні 24 години
+        # Суворий фільтр
         if bill_date >= one_day_ago:
             bill_id = f"{bill['congress']}_{bill['type']}_{bill['number']}"
             recent_bills.append({
@@ -119,4 +132,4 @@ if __name__ == "__main__":
             sent_count += 1
             
     save_processed(processed)
-    print(f"Успішно оброблено нових законопроєктів за добу: {sent_count}")
+    print(f"Успішно оброблено нових законопроєктів: {sent_count}")
