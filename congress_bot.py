@@ -54,7 +54,7 @@ def fetch_recent_bills():
     bills = data.get("bills", [])
     
     recent_bills = []
-    # Межа — 24 години тому
+    # Межа — 24 години тому (UTC)
     one_day_ago = datetime.now(timezone.utc) - timedelta(hours=24)
     
     for bill in bills:
@@ -62,9 +62,14 @@ def fetch_recent_bills():
         if not update_date_str:
             continue
             
-        # Парсимо дату оновлення від API
         try:
+            # Парсимо дату
             bill_date = datetime.fromisoformat(update_date_str.replace("Z", "+00:00"))
+            
+            # ВИПРАВЛЕННЯ: Якщо API повернуло "наївну" дату без часового поясу, примусово робимо її UTC
+            if bill_date.tzinfo is None:
+                bill_date = bill_date.replace(tzinfo=timezone.utc)
+                
         except Exception:
             continue
             
