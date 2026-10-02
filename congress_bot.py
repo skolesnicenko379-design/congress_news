@@ -32,13 +32,13 @@ def is_technical(title):
 
 def escape_md(text):
     if not text: return ""
-    return text.replace('*', '').replace('_', '').replace('`', '').replace('[', '(').replace(']', ')')
+    return str(text).replace('*', '').replace('_', '').replace('`', '').replace('[', '(').replace(']', ')')
 
 def process_with_ai(title, status_en, summary_en):
-    """Використовує Groq (Llama 3.1) для перекладу та аналізу суті закону"""
+    """Використовує Groq для перекладу. Стійкий до помилок формату."""
     if not GROQ_API_KEY:
-        print("ПОМИЛКА: Немає GROQ_API_KEY! Передаємо оригінали.")
-        return title, status_en, "Переклад неможливий через відсутність ключа Groq."
+        print("Попередження: Немає GROQ_API_KEY! Передаємо оригінали.")
+        return title, status_en, "Переклад неможливий (немає ключа)."
         
     ai_prompt = f"""Ти — професійний політичний аналітик. Переклади та поясни законопроєкт Конгресу США.
 Назва: {title}
@@ -47,8 +47,8 @@ def process_with_ai(title, status_en, summary_en):
 
 Поверни виключно JSON об'єкт з трьома ключами:
 1. "title_uk" - точний переклад назви.
-2. "status_uk" - точний переклад статусу (наприклад "Передано до Комітету з фінансів").
-3. "summary_uk" - коротке і чітке пояснення українською (1-2 речення), про що цей закон і навіщо він потрібен. Якщо "Офіційне резюме" відсутнє, зроби логічний висновок самостійно на основі назви.
+2. "status_uk" - точний переклад статусу.
+3. "summary_uk" - коротке і чітке пояснення українською (1-2 речення), про що цей закон. Якщо "Офіційне резюме" відсутнє, зроби висновок самостійно на основі назви.
 
 Не пиши нічого крім JSON."""
 
@@ -68,14 +68,15 @@ def process_with_ai(title, status_en, summary_en):
         res = requests.post(url, headers=headers, json=payload)
         if res.status_code == 200:
             data = res.json()["choices"][0]["message"]["content"]
+            print(f"Відповідь ШІ: {data}") # Логуємо для дебагу
             result = json.loads(data)
-            return result.get("title_uk", title), result.get("status_uk", status_en), result.get("summary_uk", "Не вдалося згенерувати опис.")
+            return result.get("title_uk", title), result.get("status_uk", status_en), result.get("summary_uk", "Опис відсутній.")
         else:
-            print(f"Помилка Groq API: {res.text}")
+            print(f"Помилка Groq API ({res.status_code}): {res.text}")
     except Exception as e:
         print(f"Помилка обробки ШІ: {e}")
         
-    return title, status_en, "Переклад тимчасово недоступний через помилку ШІ."
+    return title, status_en, "Помилка генерації опису."
 
 def get_public_url(congress, bill_type, number):
     type_map = {
@@ -130,17 +131,16 @@ def save_processed(processed):
 def fetch_recent_bills():
     current_congress = get_current_congress()
     url = f"https://api.congress.gov/v3/bill/{current_congress}?sort=updateDate+desc"
-    params = {"api_key": API_KEY, "limit": 10} # Зменшено для ШІ, щоб не зловити Rate Limit
+    params = {"api_key": API_KEY, "limit": 10} 
     
     response = requests.get(url, params=params)
     if response.status_code != 200:
+        print(f"Помилка API Конгресу: {response.status_code}")
         return []
         
     bills = response.json().get("bills", [])
     recent_bills = []
-    
-    # 2 дні для тесту, потім зміни на hours=24
-    one_day_ago = datetime.now(timezone.utc) - timedelta(days=2)
+    one_day_ago = datetime.now(timezone.utc) - timedelta(days=2) 
     
     for bill in bills:
         if not bill.get("updateDate"): continue
@@ -157,9 +157,13 @@ def fetch_recent_bills():
     return recent_bills
 
 def send_telegram(text):
-    if not TOKEN or not CHAT_ID: return
+    if not TOKEN or not CHAT_ID: 
+        print("Помилка: Немає Telegram токенів!")
+        return
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True})
+    res = requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True})
+    if res.status_code != 200:
+        print(f"Помилка Telegram API: {res.text}")
 
 if __name__ == "__main__":
     processed = load_processed()
@@ -172,7 +176,7 @@ if __name__ == "__main__":
         if bill_id in processed:
             continue
             
-        if is_technical(bill.get("title", "")) or is_technical(bill.get("latestAction", {}).get("text", "")) :
+        if is_technical(bill.get("title", "")) or is_technical(bill.get("latestAction", {}).get("text", "")):
             processed.append(bill_id)
             continue
             
