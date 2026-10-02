@@ -213,7 +213,7 @@ def fetch_recent_bills():
 
     bills = response.json().get("bills", [])
     recent_bills = []
-    one_day_ago = datetime.now(timezone.utc) - timedelta(days=2)
+    one_day_ago = datetime.now(timezone.utc) - timedelta(hours=24)
 
     for bill in bills:
         if not bill.get("updateDate"):
