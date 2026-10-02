@@ -8,7 +8,6 @@ from datetime import datetime, timezone, timedelta
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 API_KEY = os.getenv("CONGRESS_API_KEY")
-# Автоматично видаляємо випадкові пробіли чи крапки з кінця ключа
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip(" .")
 
 STATE_FILE = "processed_bills.json"
@@ -32,7 +31,6 @@ def is_technical(title):
     ]
     return any(phrase in t for phrase in stop_words)
 
-# Використовуємо HTML замість Markdown для уникнення збоїв з дужками
 def escape_html(text):
     if not text: return ""
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -59,7 +57,7 @@ def process_with_ai(title, status_en, summary_en):
         "Content-Type": "application/json"
     }
     payload = {
-        "model": "llama-3.1-8b-instant",
+        "model": "llama3-8b-8192", # ВАЖЛИВО: Змінили модель на стабільну
         "messages": [{"role": "user", "content": ai_prompt}],
         "temperature": 0.2
     }
@@ -77,7 +75,6 @@ def process_with_ai(title, status_en, summary_en):
                     return title, status_en, "Помилка читання JSON від ШІ."
             return title, status_en, "ШІ не повернув формат JSON."
         else:
-            # ВАЖЛИВО: Передаємо точну помилку від сервера прямо в Telegram
             err_msg = res.json().get('error', {}).get('message', res.text)
             return title, status_en, f"Помилка API ({res.status_code}): {err_msg}"
             
@@ -194,7 +191,6 @@ if __name__ == "__main__":
         
         public_url = get_public_url(bill["congress"], bill["type"], bill["number"])
         
-        # Використовуємо HTML форматування
         message = (
             f"🇺🇸 <b>Конгрес США ({bill['congress']}-е скликання)</b>\n\n"
             f"📌 <b>{bill['type'].upper()} {bill['number']}</b>\n"
