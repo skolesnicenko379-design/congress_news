@@ -77,12 +77,10 @@ def process_with_ai(title, status_en, summary_en):
 Статус: {status_en}
 Офіційне резюме: {summary_en if summary_en else 'Відсутнє.'}
 
-Поверни ВИКЛЮЧНО валідний JSON об'єкт з трьома ключами:
+Поверни об'єкт JSON з трьома ключами:
 1. "title_uk" - точний переклад назви.
 2. "status_uk" - точний переклад статусу.
-3. "summary_uk" - коротке і чітке пояснення українською (1-2 речення), про що цей закон. Якщо "Офіційне резюме" відсутнє, зроби логічний висновок самостійно на основі назви.
-
-БЕЗ жодних вступних слів. Тільки JSON."""
+3. "summary_uk" - коротке і чітке пояснення українською (1-2 речення), про що цей закон. Якщо "Офіційне резюме" відсутнє, зроби логічний висновок самостійно на основі назви."""
 
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
@@ -92,7 +90,8 @@ def process_with_ai(title, status_en, summary_en):
     payload = {
         "model": model_name,
         "messages": [{"role": "user", "content": ai_prompt}],
-        "temperature": 0.2
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"}  # ЖОРСТКО ВИМАГАЄМО JSON
     }
 
     try:
@@ -103,10 +102,14 @@ def process_with_ai(title, status_en, summary_en):
             if match:
                 try:
                     result = json.loads(match.group(0))
-                    return result.get("title_uk", title), result.get("status_uk", status_en), result.get("summary_uk", "Опис відсутній.")
-                except:
-                    return title, status_en, "Помилка читання JSON від ШІ."
-            return title, status_en, "ШІ не повернув формат JSON."
+                    return (
+                        result.get("title_uk", title), 
+                        result.get("status_uk", status_en), 
+                        result.get("summary_uk", "Опис відсутній.")
+                    )
+                except json.JSONDecodeError:
+                    pass
+            return title, status_en, title
         else:
             err_msg = res.json().get('error', {}).get('message', res.text)
             return title, status_en, f"Помилка API ({res.status_code}): {err_msg}"
