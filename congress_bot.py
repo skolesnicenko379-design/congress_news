@@ -52,7 +52,7 @@ def process_with_ai(title, status_en, summary_en):
 
 БЕЗ жодних вступних слів, маркдауну чи коментарів. Тільки JSON."""
 
-    url = "[https://api.groq.com/openai/v1/chat/completions](https://api.groq.com/openai/v1/chat/completions)"
+    url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json"
@@ -70,7 +70,6 @@ def process_with_ai(title, status_en, summary_en):
             data = res.json()["choices"][0]["message"]["content"]
             print(f"Відповідь ШІ: {data}")
             
-            # ЖОРСТКА ОЧИСТКА (використовуємо безпечні подвійні лапки)
             data_clean = data.replace("```json", "").replace("```", "").strip()
             
             try:
@@ -94,14 +93,14 @@ def get_public_url(congress, bill_type, number):
         "hres": "house-resolution", "sres": "senate-resolution"
     }
     full_type = type_map.get(bill_type.lower(), "bill")
-    return f"[https://www.congress.gov/bill/](https://www.congress.gov/bill/){congress}th-congress/{full_type}/{number}"
+    return f"https://www.congress.gov/bill/{congress}th-congress/{full_type}/{number}"
 
 def get_bill_details(congress, b_type, number):
     sponsor = "Невідомо"
     status_en = "Introduced"
     summary_en = ""
     
-    url = f"[https://api.congress.gov/v3/bill/](https://api.congress.gov/v3/bill/){congress}/{b_type.lower()}/{number}?api_key={API_KEY}"
+    url = f"https://api.congress.gov/v3/bill/{congress}/{b_type.lower()}/{number}?api_key={API_KEY}"
     res = requests.get(url)
     if res.status_code == 200:
         data = res.json().get("bill", {})
@@ -113,7 +112,7 @@ def get_bill_details(congress, b_type, number):
         if action:
             status_en = action
             
-    url_sum = f"[https://api.congress.gov/v3/bill/](https://api.congress.gov/v3/bill/){congress}/{b_type.lower()}/{number}/summaries?api_key={API_KEY}"
+    url_sum = f"https://api.congress.gov/v3/bill/{congress}/{b_type.lower()}/{number}/summaries?api_key={API_KEY}"
     res_sum = requests.get(url_sum)
     if res_sum.status_code == 200:
         summaries = res_sum.json().get("summaries", [])
@@ -168,7 +167,7 @@ def send_telegram(text):
     if not TOKEN or not CHAT_ID: 
         print("Помилка: Немає Telegram токенів!")
         return
-    url = f"[https://api.telegram.org/bot](https://api.telegram.org/bot){TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
     res = requests.post(url, json={"chat_id": CHAT_ID, "text": text, "parse_mode": "Markdown", "disable_web_page_preview": True})
     if res.status_code != 200:
         print(f"Помилка Telegram API: {res.text}")
