@@ -119,7 +119,7 @@ def process_with_ai(title, status_en, summary_en, subjects=None):
         }
         if use_json_mode:
             payload["response_format"] = {"type": "json_object"}
-        return requests.post(url, headers=headers, json=payload)
+        return requests.post(url, headers=headers, json=payload, timeout=60)
 
     try:
         res = call(use_json_mode=True)
@@ -180,7 +180,7 @@ def get_bill_details(congress, b_type, number):
     subjects = []
 
     url = f"https://api.congress.gov/v3/bill/{congress}/{b_type.lower()}/{number}?api_key={API_KEY}"
-    res = requests.get(url)
+    res = requests.get(url, timeout=20)
     if res.status_code == 200:
         data = res.json().get("bill", {})
         sponsors = data.get("sponsors", [])
@@ -192,7 +192,7 @@ def get_bill_details(congress, b_type, number):
             status_en = action
 
     url_sum = f"https://api.congress.gov/v3/bill/{congress}/{b_type.lower()}/{number}/summaries?api_key={API_KEY}"
-    res_sum = requests.get(url_sum)
+    res_sum = requests.get(url_sum, timeout=20)
     if res_sum.status_code == 200:
         summaries = res_sum.json().get("summaries", [])
         if summaries:
@@ -231,91 +231,175 @@ def load_processed():
 
 def save_processed(processed):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(processed[-100:], f, ensure_ascii=False, indent=2)
+        json.dump(list(dict.fromkeys(processed)), f, ensure_ascii=False, indent=2)
+
+
+def parse_update_date(bill):
+    """Повертає дату оновлення в UTC або None, якщо дата відсутня/некоректна."""
+    value = bill.get("updateDate")
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return None
 
 
 def fetch_recent_bills():
+    if not API_KEY:
+        raise RuntimeError("Не задано секрет CONGRESS_API_KEY.")
+
     current_congress = get_current_congress()
-    url = f"https://api.congress.gov/v3/bill/{current_congress}?sort=updateDate+desc"
-    params = {"api_key": API_KEY, "limit": 10}
-
-    response = requests.get(url, params=params)
-    if response.status_code != 200:
-        return []
-
-    bills = response.json().get("bills", [])
+    url = f"https://api.congress.gov/v3/bill/{current_congress}"
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
     recent_bills = []
-    one_day_ago = datetime.now(timezone.utc) - timedelta(hours=24)
+    seen_ids = set()
+    limit = 250
+    max_pages = 5
 
-    for bill in bills:
-        if not bill.get("updateDate"):
-            continue
+    print(f"Congress.gov: скликання {current_congress}; шукаємо документи, оновлені після {cutoff.isoformat()}.")
+
+    for page in range(max_pages):
+        params = {
+            "api_key": API_KEY,
+            "limit": limit,
+            "offset": page * limit,
+            "sort": "updateDate+desc",
+        }
         try:
-            bill_date = datetime.fromisoformat(bill["updateDate"].replace("Z", "+00:00"))
-            if bill_date.tzinfo is None:
-                bill_date = bill_date.replace(tzinfo=timezone.utc)
-        except Exception:
-            continue
+            response = requests.get(url, params=params, timeout=30)
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Помилка з'єднання з Congress.gov API: {exc}") from exc
 
-        if bill_date >= one_day_ago:
-            recent_bills.append(bill)
+        if response.status_code != 200:
+            excerpt = response.text[:500].replace("\n", " ")
+            raise RuntimeError(f"Congress.gov API повернув HTTP {response.status_code}: {excerpt}")
 
+        bills = response.json().get("bills", [])
+        print(f"Congress.gov сторінка {page + 1}: HTTP {response.status_code}; отримано документів: {len(bills)}.")
+        if not bills:
+            break
+
+        page_dates = [parse_update_date(bill) for bill in bills]
+        for bill, bill_date in zip(bills, page_dates):
+            if bill_date is None or bill_date < cutoff:
+                continue
+            bill_id = f"{bill.get('congress')}_{bill.get('type')}_{bill.get('number')}"
+            if bill_id not in seen_ids:
+                recent_bills.append(bill)
+                seen_ids.add(bill_id)
+
+        # За спадного сортування після першої сторінки, що перетнула межу доби,
+        # наступні сторінки вже не потрібні.
+        valid_dates = [value for value in page_dates if value is not None]
+        if valid_dates and min(valid_dates) < cutoff:
+            break
+        if len(bills) < limit:
+            break
+
+    print(f"Congress.gov: знайдено документів за останні 24 години: {len(recent_bills)}.")
+    if not recent_bills:
+        print("За останні 24 години документів не знайдено. Перевірте часовий фільтр та відповідь API.")
     return recent_bills
 
 
 def send_telegram(text):
     if not TOKEN or not CHAT_ID:
-        return
+        raise RuntimeError("Не задано TELEGRAM_BOT_TOKEN або TELEGRAM_CHAT_ID.")
+
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    requests.post(url, json={
-        "chat_id": CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    })
+    try:
+        response = requests.post(url, json={
+            "chat_id": CHAT_ID,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True
+        }, timeout=20)
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Помилка з'єднання з Telegram API: {exc}") from exc
+
+    try:
+        result = response.json()
+    except ValueError:
+        result = {}
+
+    if response.status_code != 200 or not result.get("ok"):
+        description = result.get("description", response.text[:500])
+        raise RuntimeError(f"Telegram API не підтвердив публікацію (HTTP {response.status_code}): {description}")
+    return True
 
 
 if __name__ == "__main__":
+    if not TOKEN or not CHAT_ID:
+        raise RuntimeError("Відсутні TELEGRAM_BOT_TOKEN або TELEGRAM_CHAT_ID.")
+    if not API_KEY:
+        raise RuntimeError("Відсутній CONGRESS_API_KEY.")
+
     processed = load_processed()
+    print(f"У базі вже оброблених документів: {len(processed)}.")
     recent_bills = fetch_recent_bills()
     sent_count = 0
+    already_processed = 0
+    technical_count = 0
+    failed_count = 0
 
     for bill in recent_bills:
         bill_id = f"{bill['congress']}_{bill['type']}_{bill['number']}"
 
         if bill_id in processed:
+            already_processed += 1
             continue
 
         if is_technical(bill.get("title", "")) or is_technical(bill.get("latestAction", {}).get("text", "")):
+            technical_count += 1
+            print(f"Пропущено як технічний документ: {bill_id} | {bill.get('title', '')}")
             processed.append(bill_id)
             continue
 
-        print(f"Обробка закону: {bill_id}")
+        print(f"Обробка закону: {bill_id} | оновлено: {bill.get('updateDate', 'невідомо')}")
 
-        sponsor, status_en, summary_en, subjects = get_bill_details(bill["congress"], bill["type"], bill["number"])
-        title_uk, status_uk, desc_uk, categories = process_with_ai(
-            bill["title"], status_en, summary_en, subjects
-        )
+        try:
+            sponsor, status_en, summary_en, subjects = get_bill_details(
+                bill["congress"], bill["type"], bill["number"]
+            )
+            title_uk, status_uk, desc_uk, categories = process_with_ai(
+                bill["title"], status_en, summary_en, subjects
+            )
 
-        public_url = get_public_url(bill["congress"], bill["type"], bill["number"])
-        categories_text = category_labels(categories)
+            public_url = get_public_url(bill["congress"], bill["type"], bill["number"])
+            categories_text = category_labels(categories)
+            message = (
+                f"🇺🇸 <b>Конгрес США ({bill['congress']}-е скликання)</b>\n\n"
+                f"📌 <b>{bill['type'].upper()} {bill['number']}</b>\n"
+                f"<b>{escape_html(title_uk)}</b>\n"
+                f"🏷 <b>Категорії:</b> {escape_html(categories_text)}\n\n"
+                f"👤 <b>Ініціатор:</b> {escape_html(sponsor)}\n"
+                f"📜 <b>Статус:</b> {escape_html(status_uk)}\n\n"
+                f"💡 <b>Суть:</b> {escape_html(desc_uk)}\n\n"
+                f"🔗 <a href='{public_url}'>Оригінал документа</a>"
+            )
 
-        message = (
-            f"🇺🇸 <b>Конгрес США ({bill['congress']}-е скликання)</b>\n\n"
-            f"📌 <b>{bill['type'].upper()} {bill['number']}</b>\n"
-            f"<b>{escape_html(title_uk)}</b>\n"
-            f"🏷 <b>Категорії:</b> {escape_html(categories_text)}\n\n"
-            f"👤 <b>Ініціатор:</b> {escape_html(sponsor)}\n"
-            f"📜 <b>Статус:</b> {escape_html(status_uk)}\n\n"
-            f"💡 <b>Суть:</b> {escape_html(desc_uk)}\n\n"
-            f"🔗 <a href='{public_url}'>Оригінал документа</a>"
-        )
-
-        send_telegram(message)
-        processed.append(bill_id)
-        sent_count += 1
-
-        time.sleep(3)
+            send_telegram(message)
+            # Фіксуємо ID лише після підтвердження успішної публікації.
+            processed.append(bill_id)
+            sent_count += 1
+            print(f"Telegram підтвердив публікацію: {bill_id}")
+            time.sleep(3)
+        except Exception as exc:
+            failed_count += 1
+            print(f"ПОМИЛКА для {bill_id}: {exc}")
+            # Невдалий документ не потрапляє до processed і може бути повторений.
+            continue
 
     save_processed(processed)
-    print(f"Успішно оброблено та відправлено: {sent_count}")
+    print(
+        "ПІДСУМОК: "
+        f"знайдено={len(recent_bills)}; "
+        f"вже оброблено={already_processed}; "
+        f"технічні пропуски={technical_count}; "
+        f"успішно опубліковано={sent_count}; "
+        f"помилки={failed_count}."
+    )
+    if failed_count:
+        raise RuntimeError(f"Не вдалося обробити/опублікувати {failed_count} документ(ів); див. журнал вище.")
