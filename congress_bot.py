@@ -85,9 +85,11 @@ def escape_html(text):
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
-def process_with_ai(title, status_en, summary_en):
+def process_with_ai(title, status_en, summary_en, subjects=None):
     if not GROQ_API_KEY:
-        return title, status_en, "Помилка: Ключ GROQ_API_KEY не знайдено."
+        return title, status_en, "Помилка: Ключ GROQ_API_KEY не знайдено.", ["OTHER"]
+
+    subjects_text = ", ".join(subjects or []) or "Офіційні тематичні рубрики відсутні."
 
     model_name = get_best_model()
 
@@ -95,11 +97,13 @@ def process_with_ai(title, status_en, summary_en):
 Назва: {title}
 Статус: {status_en}
 Офіційне резюме: {summary_en if summary_en else 'Відсутнє.'}
+Офіційні тематичні рубрики Congress.gov: {subjects_text}
 
-Поверни об'єкт JSON з трьома ключами:
+Поверни об'єкт JSON з чотирма ключами:
 1. "title_uk" - точний переклад назви.
 2. "status_uk" - точний переклад статусу.
-3. "summary_uk" - коротке і чітке пояснення українською (1-2 речення), про що цей закон. Якщо "Офіційне резюме" відсутнє, зроби логічний висновок самостійно на основі назви."""
+3. "summary_uk" - коротке пояснення українською (1-2 речення). Якщо офіційне резюме відсутнє, не вигадуй деталей.
+4. "categories" - масив із однієї або кількох категорій: "MILITARY", "INTERNATIONAL", "ECONOMICS", "OTHER". MILITARY: оборонний бюджет, збройні сили, зброя, боєприпаси, військові технології, оборонна промисловість, військові закупівлі та дослідження. INTERNATIONAL: зовнішня політика, дипломатія, договори, санкції, міжнародні організації, відносини з іншими державами, міжнародна допомога, зовнішня торгівля та обмеження. ECONOMICS: федеральний бюджет і борг, податки, внутрішня економічна політика, банки, фінанси, енергетика, промисловість, праця та внутрішні ринки. OTHER: решта тем. Дозволено кілька категорій, якщо є реальний змістовний перетин. Не класифікуй як INTERNATIONAL лише через географічну назву або іноземне походження людини. Відповідай лише валідним JSON."""
 
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
@@ -132,20 +136,30 @@ def process_with_ai(title, status_en, summary_en):
             if match:
                 try:
                     result = json.loads(match.group(0))
+                    valid_categories = {"MILITARY", "INTERNATIONAL", "ECONOMICS", "OTHER"}
+                    categories = result.get("categories", ["OTHER"])
+                    if not isinstance(categories, list):
+                        categories = ["OTHER"]
+                    categories = [x for x in categories if x in valid_categories]
+                    if not categories:
+                        categories = ["OTHER"]
+                    if "OTHER" in categories and len(categories) > 1:
+                        categories.remove("OTHER")
                     return (
                         result.get("title_uk", title),
                         result.get("status_uk", status_en),
-                        result.get("summary_uk", "Опис відсутній.")
+                        result.get("summary_uk", "Опис відсутній."),
+                        categories
                     )
                 except json.JSONDecodeError:
                     pass
-            return title, status_en, title
+            return title, status_en, title, ["OTHER"]
         else:
             err_msg = res.json().get('error', {}).get('message', res.text)
-            return title, status_en, f"Помилка API ({res.status_code}): {err_msg}"
+            return title, status_en, f"Помилка API ({res.status_code}): {err_msg}", ["OTHER"]
 
     except Exception as e:
-        return title, status_en, f"Збій з'єднання: {e}"
+        return title, status_en, f"Збій з'єднання: {e}", ["OTHER"]
 
 
 def get_public_url(congress, bill_type, number):
@@ -184,7 +198,24 @@ def get_bill_details(congress, b_type, number):
             summary_en = summaries[0].get("text", "")
             summary_en = re.sub(r'<[^>]+>', '', summary_en)
 
-    return sponsor, status_en, summary_en
+    url_subjects = f"https://api.congress.gov/v3/bill/{congress}/{b_type.lower()}/{number}/subjects?api_key={API_KEY}"
+    try:
+        res_subjects = requests.get(url_subjects, timeout=15)
+        if res_subjects.status_code == 200:
+            subject_data = res_subjects.json().get("subjects", {})
+            subjects = [x.get("name", "") for x in subject_data.get("legislativeSubjects", []) if x.get("name")]
+            policy_area = subject_data.get("policyArea", {})
+            if isinstance(policy_area, dict) and policy_area.get("name"):
+                subjects.append(policy_area["name"])
+    except Exception as e:
+        print(f"Не вдалося отримати теми для {congress}/{b_type}/{number}: {e}")
+
+    return sponsor, status_en, summary_en, subjects
+
+
+def category_labels(categories):
+    labels = {"MILITARY": "#Оборона", "INTERNATIONAL": "#МіжнародніВідносини", "ECONOMICS": "#Економіка", "OTHER": "#Інше"}
+    return " ".join(labels.get(category, "#Інше") for category in categories)
 
 
 def load_processed():
@@ -260,15 +291,19 @@ if __name__ == "__main__":
 
         print(f"Обробка закону: {bill_id}")
 
-        sponsor, status_en, summary_en = get_bill_details(bill["congress"], bill["type"], bill["number"])
-        title_uk, status_uk, desc_uk = process_with_ai(bill["title"], status_en, summary_en)
+        sponsor, status_en, summary_en, subjects = get_bill_details(bill["congress"], bill["type"], bill["number"])
+        title_uk, status_uk, desc_uk, categories = process_with_ai(
+            bill["title"], status_en, summary_en, subjects
+        )
 
         public_url = get_public_url(bill["congress"], bill["type"], bill["number"])
+        categories_text = category_labels(categories)
 
         message = (
             f"🇺🇸 <b>Конгрес США ({bill['congress']}-е скликання)</b>\n\n"
             f"📌 <b>{bill['type'].upper()} {bill['number']}</b>\n"
-            f"<b>{escape_html(title_uk)}</b>\n\n"
+            f"<b>{escape_html(title_uk)}</b>\n"
+            f"🏷 <b>Категорії:</b> {escape_html(categories_text)}\n\n"
             f"👤 <b>Ініціатор:</b> {escape_html(sponsor)}\n"
             f"📜 <b>Статус:</b> {escape_html(status_uk)}\n\n"
             f"💡 <b>Суть:</b> {escape_html(desc_uk)}\n\n"
