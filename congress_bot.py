@@ -177,6 +177,7 @@ def get_bill_details(congress, b_type, number):
     sponsor = "Невідомо"
     status_en = "Introduced"
     summary_en = ""
+    subjects = []
 
     url = f"https://api.congress.gov/v3/bill/{congress}/{b_type.lower()}/{number}?api_key={API_KEY}"
     res = requests.get(url)
