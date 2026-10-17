@@ -33,6 +33,7 @@ jobs:
         run: python congress_bot.py
 
       - name: Збереження бази оброблених документів
+        if: always()
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
