@@ -282,6 +282,16 @@ def fetch_recent_bills():
             break
 
         page_dates = [parse_update_date(bill) for bill in bills]
+        valid_dates = [value for value in page_dates if value is not None]
+        if valid_dates:
+            print(
+                f"Діапазон updateDate на сторінці {page + 1}: "
+                f"{min(valid_dates).isoformat()} — {max(valid_dates).isoformat()}; "
+                f"дат без розпізнавання: {len(bills) - len(valid_dates)}."
+            )
+        else:
+            print(f"Увага: на сторінці {page + 1} немає жодної розпізнаної updateDate.")
+
         for bill, bill_date in zip(bills, page_dates):
             if bill_date is None or bill_date < cutoff:
                 continue
@@ -292,7 +302,6 @@ def fetch_recent_bills():
 
         # За спадного сортування після першої сторінки, що перетнула межу доби,
         # наступні сторінки вже не потрібні.
-        valid_dates = [value for value in page_dates if value is not None]
         if valid_dates and min(valid_dates) < cutoff:
             break
         if len(bills) < limit:
@@ -300,7 +309,12 @@ def fetch_recent_bills():
 
     print(f"Congress.gov: знайдено документів за останні 24 години: {len(recent_bills)}.")
     if not recent_bills:
-        print("За останні 24 години документів не знайдено. Перевірте часовий фільтр та відповідь API.")
+        print("За останні 24 години документів не знайдено. Нижче — до 5 перших записів API для перевірки сортування та формату дат:")
+        for bill in bills[:5] if 'bills' in locals() else []:
+            print(
+                f"ДІАГНОСТИКА API: {bill.get('congress')}_{bill.get('type')}_{bill.get('number')} | "
+                f"updateDate={bill.get('updateDate', 'відсутня')} | title={bill.get('title', '')}"
+            )
     return recent_bills
 
 
@@ -349,6 +363,11 @@ if __name__ == "__main__":
 
         if bill_id in processed:
             already_processed += 1
+            print(
+                f"УЖЕ ОБРОБЛЕНО: {bill_id} | "
+                f"оновлено={bill.get('updateDate', 'невідомо')} | "
+                f"title={bill.get('title', '')}"
+            )
             continue
 
         if is_technical(bill.get("title", "")) or is_technical(bill.get("latestAction", {}).get("text", "")):
