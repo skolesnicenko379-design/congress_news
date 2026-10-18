@@ -310,7 +310,7 @@ def fetch_recent_bills():
     print(f"Congress.gov: знайдено документів за останні 24 години: {len(recent_bills)}.")
     if not recent_bills:
         print("За останні 24 години документів не знайдено. Нижче — до 5 перших записів API для перевірки сортування та формату дат:")
-        for bill in bills[:5] if 'bills' in locals() else []:
+        for bill in (bills[:5] if 'bills' in locals() else []):
             print(
                 f"ДІАГНОСТИКА API: {bill.get('congress')}_{bill.get('type')}_{bill.get('number')} | "
                 f"updateDate={bill.get('updateDate', 'відсутня')} | title={bill.get('title', '')}"
