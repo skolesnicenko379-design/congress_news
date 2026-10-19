@@ -1,6 +1,10 @@
 name: Congress Bill Tracker
 
 on:
+  push:
+    paths:
+      - 'congress_bot.py'
+      - '.github/workflows/tracker.yml'
   schedule:
     - cron: '0 */5 * * *' # Запуск кожні 5 годин
   workflow_dispatch: # Дозволяє запускати вручну кнопкою
