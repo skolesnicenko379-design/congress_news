@@ -252,32 +252,56 @@ def fetch_recent_bills():
 
     current_congress = get_current_congress()
     url = f"https://api.congress.gov/v3/bill/{current_congress}"
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=24)
+
+    # Congress.gov документує fromDateTime/toDateTime для фільтрації за updateDate.
+    # Відступ на добу потрібен, бо частина відповідей може містити updateDate
+    # лише як YYYY-MM-DD, без часу, інакше можна втратити записи на межі доби.
+    api_from = (cutoff - timedelta(days=1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
     recent_bills = []
     seen_ids = set()
     limit = 250
-    max_pages = 5
+    offset = 0
+    page = 0
 
-    print(f"Congress.gov: скликання {current_congress}; шукаємо документи, оновлені після {cutoff.isoformat()}.")
+    print(
+        f"Congress.gov: скликання {current_congress}; "
+        f"шукаємо документи після {cutoff.isoformat()} "
+        f"(API-вікно від {api_from.isoformat()} до {now.isoformat()})."
+    )
 
-    for page in range(max_pages):
+    while True:
         params = {
             "api_key": API_KEY,
             "limit": limit,
-            "offset": page * limit,
+            "offset": offset,
+            "fromDateTime": api_from.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "toDateTime": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "sort": "updateDate+desc",
         }
+
         try:
             response = requests.get(url, params=params, timeout=30)
         except requests.RequestException as exc:
             raise RuntimeError(f"Помилка з'єднання з Congress.gov API: {exc}") from exc
 
         if response.status_code != 200:
-            excerpt = response.text[:500].replace("\n", " ")
-            raise RuntimeError(f"Congress.gov API повернув HTTP {response.status_code}: {excerpt}")
+            excerpt = response.text[:500].replace("\\n", " ")
+            raise RuntimeError(
+                f"Congress.gov API повернув HTTP {response.status_code}: {excerpt}"
+            )
 
-        bills = response.json().get("bills", [])
-        print(f"Congress.gov сторінка {page + 1}: HTTP {response.status_code}; отримано документів: {len(bills)}.")
+        payload = response.json()
+        bills = payload.get("bills", [])
+        page += 1
+        print(
+            f"Congress.gov сторінка {page} (offset={offset}): "
+            f"HTTP {response.status_code}; отримано документів: {len(bills)}."
+        )
+
         if not bills:
             break
 
@@ -285,38 +309,62 @@ def fetch_recent_bills():
         valid_dates = [value for value in page_dates if value is not None]
         if valid_dates:
             print(
-                f"Діапазон updateDate на сторінці {page + 1}: "
+                f"Діапазон updateDate на сторінці {page}: "
                 f"{min(valid_dates).isoformat()} — {max(valid_dates).isoformat()}; "
                 f"дат без розпізнавання: {len(bills) - len(valid_dates)}."
             )
         else:
-            print(f"Увага: на сторінці {page + 1} немає жодної розпізнаної updateDate.")
+            print(
+                f"Увага: на сторінці {page} немає жодної розпізнаної updateDate."
+            )
 
         for bill, bill_date in zip(bills, page_dates):
-            if bill_date is None or bill_date < cutoff:
+            raw_date = str(bill.get("updateDate", "")).strip()
+            if bill_date is None:
+                print(
+                    "Пропущено запис без коректної updateDate: "
+                    f"{bill.get('congress')}_{bill.get('type')}_{bill.get('number')}"
+                )
                 continue
-            bill_id = f"{bill.get('congress')}_{bill.get('type')}_{bill.get('number')}"
+
+            # Якщо API повернув повний timestamp, фільтруємо точно за 24 годинами.
+            # Якщо повернулася лише календарна дата, точний час невідомий, тому
+            # беремо попередню календарну дату як захисний запас від пропусків.
+            if len(raw_date) <= 10:
+                if bill_date.date() < (cutoff.date() - timedelta(days=1)):
+                    continue
+            elif bill_date < cutoff:
+                continue
+
+            bill_id = (
+                f"{bill.get('congress')}_{bill.get('type')}_{bill.get('number')}"
+            )
             if bill_id not in seen_ids:
                 recent_bills.append(bill)
                 seen_ids.add(bill_id)
 
-        # За спадного сортування після першої сторінки, що перетнула межу доби,
-        # наступні сторінки вже не потрібні.
-        if valid_dates and min(valid_dates) < cutoff:
-            break
+        # Не зупиняємося за мінімальною датою сторінки: пагінація продовжується,
+        # доки API повертає записи в межах запитаного діапазону.
         if len(bills) < limit:
             break
+        offset += limit
 
-    print(f"Congress.gov: знайдено документів за останні 24 години: {len(recent_bills)}.")
+    # Захисне сортування на стороні клієнта, незалежно від порядку API.
+    recent_bills.sort(
+        key=lambda bill: parse_update_date(bill) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+
+    print(
+        f"Congress.gov: знайдено документів у часовому вікні: {len(recent_bills)}."
+    )
     if not recent_bills:
-        print("За останні 24 години документів не знайдено. Нижче — до 5 перших записів API для перевірки сортування та формату дат:")
-        for bill in (bills[:5] if 'bills' in locals() else []):
-            print(
-                f"ДІАГНОСТИКА API: {bill.get('congress')}_{bill.get('type')}_{bill.get('number')} | "
-                f"updateDate={bill.get('updateDate', 'відсутня')} | title={bill.get('title', '')}"
-            )
-    return recent_bills
+        print(
+            "У заданому часовому вікні документів не знайдено. "
+            "Перевір параметри fromDateTime/toDateTime, сортування та API-відповідь."
+        )
 
+    return recent_bills
 
 def send_telegram(text):
     if not TOKEN or not CHAT_ID:
