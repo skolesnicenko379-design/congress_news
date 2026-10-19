@@ -331,7 +331,7 @@ def fetch_recent_bills():
             # Якщо повернулася лише календарна дата, точний час невідомий, тому
             # беремо попередню календарну дату як захисний запас від пропусків.
             if len(raw_date) <= 10:
-                if bill_date.date() < (cutoff.date() - timedelta(days=1)):
+                if bill_date.date() < cutoff.date():
                     continue
             elif bill_date < cutoff:
                 continue
