@@ -246,6 +246,28 @@ def parse_update_date(bill):
         return None
 
 
+def get_activity_date_raw(bill):
+    """Повертає дату останньої законодавчої дії; для нових записів — дату внесення."""
+    latest_action = bill.get("latestAction")
+    if isinstance(latest_action, dict):
+        value = latest_action.get("actionDate")
+        if value:
+            return str(value).strip()
+    return str(bill.get("introducedDate") or "").strip()
+
+
+def parse_activity_date(bill):
+    """Повертає дату останньої законодавчої дії/внесення в UTC, а не дату синхронізації API."""
+    value = get_activity_date_raw(bill)
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
 def fetch_recent_bills():
     if not API_KEY:
         raise RuntimeError("Не задано секрет CONGRESS_API_KEY.")
@@ -263,6 +285,8 @@ def fetch_recent_bills():
     )
     recent_bills = []
     seen_ids = set()
+    stale_activity_count = 0
+    missing_activity_date_count = 0
     limit = 250
     offset = 0
     page = 0
@@ -336,6 +360,23 @@ def fetch_recent_bills():
             elif bill_date < cutoff:
                 continue
 
+            # updateDate може змінитися через синхронізацію метаданих, навіть коли
+            # законопроєкт не мав нової законодавчої дії. Відбираємо за actionDate.
+            activity_raw = get_activity_date_raw(bill)
+            activity_date = parse_activity_date(bill)
+            if activity_date is None:
+                missing_activity_date_count += 1
+                continue
+
+            if len(activity_raw) <= 10:
+                # Для дат без часу приймаємо лише сьогоднішню UTC-дату.
+                if activity_date.date() < cutoff.date():
+                    stale_activity_count += 1
+                    continue
+            elif activity_date < cutoff:
+                stale_activity_count += 1
+                continue
+
             bill_id = (
                 f"{bill.get('congress')}_{bill.get('type')}_{bill.get('number')}"
             )
@@ -351,12 +392,14 @@ def fetch_recent_bills():
 
     # Захисне сортування на стороні клієнта, незалежно від порядку API.
     recent_bills.sort(
-        key=lambda bill: parse_update_date(bill) or datetime.min.replace(tzinfo=timezone.utc),
+        key=lambda bill: parse_activity_date(bill) or datetime.min.replace(tzinfo=timezone.utc),
         reverse=True,
     )
 
     print(
-        f"Congress.gov: знайдено документів у часовому вікні: {len(recent_bills)}."
+        f"Congress.gov: знайдено документів із новою законодавчою дією: {len(recent_bills)}; "
+        f"відсіяно зі старою дією: {stale_activity_count}; "
+        f"без коректної дати дії/внесення: {missing_activity_date_count}."
     )
     if not recent_bills:
         print(
@@ -440,7 +483,8 @@ if __name__ == "__main__":
                 f"🇺🇸 <b>Конгрес США ({bill['congress']}-е скликання)</b>\n\n"
                 f"📌 <b>{bill['type'].upper()} {bill['number']}</b>\n"
                 f"<b>{escape_html(title_uk)}</b>\n"
-                f"🏷 <b>Категорії:</b> {escape_html(categories_text)}\n\n"
+                f"🏷 <b>Категорії:</b> {escape_html(categories_text)}\n"
+                f"📅 <b>Остання законодавча дія:</b> {escape_html(get_activity_date_raw(bill) or 'невідомо')}\n\n"
                 f"👤 <b>Ініціатор:</b> {escape_html(sponsor)}\n"
                 f"📜 <b>Статус:</b> {escape_html(status_uk)}\n\n"
                 f"💡 <b>Суть:</b> {escape_html(desc_uk)}\n\n"
