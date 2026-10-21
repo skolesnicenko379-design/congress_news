@@ -454,8 +454,11 @@ def is_recent_activity(bill, now=None):
     if activity_date is None or activity_date > now:
         return False
     if len(raw_value) <= 10:
-        return activity_date.date() == now.date()
-    return activity_date >= now - timedelta(hours=24)
+        # API does not expose a time here. Use the cutoff's UTC calendar date
+        # as a documented fallback; the action date still blocks 2025/older records.
+        cutoff_date = (now - timedelta(hours=24)).date()
+        return cutoff_date <= activity_date.date() <= now.date()
+    return now - timedelta(hours=24) <= activity_date <= now
 
 
 def get_action_fingerprint(bill):
