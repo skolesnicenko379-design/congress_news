@@ -20,8 +20,8 @@ class RecentActivityTests(unittest.TestCase):
     def test_today_date_only_is_accepted(self):
         self.assertTrue(congress_bot.is_recent_activity(self.bill("2026-10-21"), self.now))
 
-    def test_cutoff_day_date_only_uses_calendar_fallback(self):
-        self.assertTrue(congress_bot.is_recent_activity(self.bill("2026-10-20"), self.now))
+    def test_yesterday_date_only_is_rejected_without_timestamp(self):
+        self.assertFalse(congress_bot.is_recent_activity(self.bill("2026-10-20"), self.now))
 
     def test_previous_calendar_day_date_only_is_rejected(self):
         self.assertFalse(congress_bot.is_recent_activity(self.bill("2026-10-19"), self.now))
