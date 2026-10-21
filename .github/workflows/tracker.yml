@@ -2,12 +2,18 @@ name: Congress Bill Tracker
 
 on:
   push:
+    branches: [main]
     paths:
       - 'congress_bot.py'
+      - 'test_congress_bot.py'
       - '.github/workflows/tracker.yml'
   schedule:
     - cron: '0 */5 * * *' # Запуск кожні 5 годин
   workflow_dispatch: # Дозволяє запускати вручну кнопкою
+
+concurrency:
+  group: congress-bill-tracker-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: write # НАДАЄМО ПРАВА НА ЗАПИС У РЕПОЗИТОРІЙ
@@ -28,6 +34,9 @@ jobs:
       - name: Встановлення залежностей
         run: pip install requests python-dotenv
 
+      - name: Перевірка регресійних тестів
+        run: python -m unittest -v
+
       - name: Запуск парсера
         env:
           CONGRESS_API_KEY: ${{ secrets.CONGRESS_API_KEY }}
@@ -42,6 +51,6 @@ jobs:
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
-          git add processed_bills.json
+          git add processed_bills.json processed_actions.json
           git diff --quiet && git diff --staged --quiet || git commit -m "Update processed bills DB"
           git push
