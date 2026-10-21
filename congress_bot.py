@@ -30,6 +30,22 @@ _CACHED_MODEL = None
 _CACHED_MODEL_ERROR = None
 
 
+def parse_delay_seconds(value):
+    """Parse Retry-After seconds or values such as 7.66s / 2m3.5s."""
+    if not value:
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        pass
+    total = 0.0
+    units = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
+    matches = re.findall(r"(\d+(?:\.\d+)?)(ms|s|m|h)", str(value).lower())
+    for amount, unit in matches:
+        total += float(amount) * units[unit]
+    return total if matches else None
+
+
 class AIProcessingError(RuntimeError):
     """AI-помилка, яку заборонено оформлювати як новину."""
 
@@ -56,11 +72,14 @@ def request_with_retry(
         if response.status_code not in retryable_statuses or attempt >= retries:
             return response
 
-        retry_after = response.headers.get("Retry-After", "")
-        try:
-            wait_seconds = max(0, min(float(retry_after), 30))
-        except (TypeError, ValueError):
+        wait_seconds = parse_delay_seconds(response.headers.get("Retry-After"))
+        if wait_seconds is None and response.status_code == 429:
+            wait_seconds = parse_delay_seconds(
+                response.headers.get("x-ratelimit-reset-tokens")
+            )
+        if wait_seconds is None:
             wait_seconds = min(2 ** attempt, 8)
+        wait_seconds = min(max(wait_seconds, 0.5), 30)
         print(
             f"HTTP {response.status_code} {method.upper()} {url}; "
             f"повтор {attempt + 1}/{retries} через {wait_seconds:g} с."
@@ -102,7 +121,7 @@ def get_best_model():
 
 
 def get_current_congress():
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     year = now.year
     if year % 2 != 0 and (now.month == 1 and now.day < 3):
         effective_year = year - 1
