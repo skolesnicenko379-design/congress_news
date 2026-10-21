@@ -3,6 +3,8 @@ import json
 import requests
 import re
 import time
+import hashlib
+import unicodedata
 from datetime import datetime, timezone, timedelta
 
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -11,6 +13,7 @@ API_KEY = os.getenv("CONGRESS_API_KEY")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip(" .")
 
 STATE_FILE = "processed_bills.json"
+ACTION_STATE_FILE = "processed_actions.json"
 
 # Моделі, для яких ПІДТВЕРДЖЕНО підтримку response_format: json_object на Groq.
 # Онови цей список, якщо Groq змінить набір доступних моделей:
@@ -23,39 +26,79 @@ JSON_CAPABLE_MODELS = [
     "gemma2-9b-it",
 ]
 
-_CACHED_MODEL = None  # кеш вибраної моделі на весь прогін скрипта
+_CACHED_MODEL = None
+_CACHED_MODEL_ERROR = None
+
+
+class AIProcessingError(RuntimeError):
+    """AI-помилка, яку заборонено оформлювати як новину."""
+
+
+def request_with_retry(
+    method, url, *, timeout=20, retries=3, retry_connection_errors=True, **kwargs
+):
+    """Повторює тимчасові HTTP-помилки з експоненційною затримкою."""
+    retryable_statuses = {429, 500, 502, 503, 504}
+    for attempt in range(retries + 1):
+        try:
+            response = requests.request(method, url, timeout=timeout, **kwargs)
+        except requests.RequestException:
+            if not retry_connection_errors or attempt >= retries:
+                raise
+            wait_seconds = min(2 ** attempt, 8)
+            print(
+                f"Мережева помилка {method.upper()} {url}; "
+                f"повтор {attempt + 1}/{retries} через {wait_seconds} с."
+            )
+            time.sleep(wait_seconds)
+            continue
+
+        if response.status_code not in retryable_statuses or attempt >= retries:
+            return response
+
+        retry_after = response.headers.get("Retry-After", "")
+        try:
+            wait_seconds = max(0, min(float(retry_after), 30))
+        except (TypeError, ValueError):
+            wait_seconds = min(2 ** attempt, 8)
+        print(
+            f"HTTP {response.status_code} {method.upper()} {url}; "
+            f"повтор {attempt + 1}/{retries} через {wait_seconds:g} с."
+        )
+        time.sleep(wait_seconds)
+    raise RuntimeError(f"Запит {method.upper()} {url} завершився без відповіді.")
+
 
 
 def get_best_model():
-    """Обирає модель один раз на запуск скрипта і кешує результат,
-    щоб не робити зайвих запитів і не отримувати різні моделі для різних біллів."""
-    global _CACHED_MODEL
+    """Обирає одну доступну JSON-сумісну модель на весь запуск."""
+    global _CACHED_MODEL, _CACHED_MODEL_ERROR
     if _CACHED_MODEL:
         return _CACHED_MODEL
+    if _CACHED_MODEL_ERROR:
+        raise AIProcessingError(_CACHED_MODEL_ERROR)
 
     url = "https://api.groq.com/openai/v1/models"
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-
     try:
-        res = requests.get(url, headers=headers, timeout=5)
-        if res.status_code == 200:
-            available = {m["id"] for m in res.json().get("data", [])}
-            print(f"Усі доступні моделі на сервері Groq: {sorted(available)}")
-
-            # Перебираємо ТІЛЬКИ перевірені JSON-сумісні моделі, у порядку пріоритету
-            for candidate in JSON_CAPABLE_MODELS:
-                if candidate in available:
-                    print(f"Обрано пріоритетну модель: {candidate}")
-                    _CACHED_MODEL = candidate
-                    return _CACHED_MODEL
-    except Exception as e:
-        print(f"Не вдалося отримати список моделей динамічно: {e}")
-
-    # Залізобетонний фоллбек: перша модель зі списку, навіть якщо не вдалось
-    # підтвердити її наявність через API — усе одно безпечніше за substring-угадування.
-    print("Жодної підтвердженої моделі не знайдено в списку доступних, беремо дефолт.")
-    _CACHED_MODEL = JSON_CAPABLE_MODELS[0]
-    return _CACHED_MODEL
+        response = request_with_retry("GET", url, headers=headers, timeout=10, retries=2)
+        if response.status_code != 200:
+            raise AIProcessingError(
+                f"Список моделей Groq недоступний: HTTP {response.status_code}."
+            )
+        available = {item.get("id") for item in response.json().get("data", [])}
+        print(f"Доступні моделі Groq: {sorted(item for item in available if item)}")
+        for candidate in JSON_CAPABLE_MODELS:
+            if candidate in available:
+                _CACHED_MODEL = candidate
+                print(f"Обрано модель Groq: {_CACHED_MODEL}")
+                return _CACHED_MODEL
+        raise AIProcessingError(
+            "Серед доступних моделей немає перевіреної JSON-сумісної моделі."
+        )
+    except Exception as exc:
+        _CACHED_MODEL_ERROR = f"Не вдалося вибрати модель Groq: {exc}"
+        raise AIProcessingError(_CACHED_MODEL_ERROR) from exc
 
 
 def get_current_congress():
@@ -86,80 +129,131 @@ def escape_html(text):
 
 
 def process_with_ai(title, status_en, summary_en, subjects=None):
+    """Перекладає документ або повертає контрольовану помилку без публікації."""
     if not GROQ_API_KEY:
-        return title, status_en, "Помилка: Ключ GROQ_API_KEY не знайдено.", ["OTHER"]
+        raise AIProcessingError("Не задано GROQ_API_KEY.")
 
-    subjects_text = ", ".join(subjects or []) or "Офіційні тематичні рубрики відсутні."
-
-    model_name = get_best_model()
+    summary_compact = " ".join((summary_en or "").split())[:4000]
+    subject_items = [
+        " ".join(str(item).split())[:100]
+        for item in (subjects or [])
+        if str(item).strip()
+    ][:15]
+    subjects_text = ", ".join(subject_items) or "Офіційні тематичні рубрики відсутні."
 
     ai_prompt = f"""Ти — професійний політичний аналітик. Переклади та поясни законопроєкт Конгресу США.
 Назва: {title}
 Статус: {status_en}
-Офіційне резюме: {summary_en if summary_en else 'Відсутнє.'}
+Офіційне резюме: {summary_compact if summary_compact else 'Відсутнє.'}
 Офіційні тематичні рубрики Congress.gov: {subjects_text}
 
 Поверни об'єкт JSON з чотирма ключами:
-1. "title_uk" - точний переклад назви.
-2. "status_uk" - точний переклад статусу.
-3. "summary_uk" - коротке пояснення українською (1-2 речення). Якщо офіційне резюме відсутнє, не вигадуй деталей.
-4. "categories" - масив із однієї або кількох категорій: "MILITARY", "INTERNATIONAL", "ECONOMICS", "OTHER". MILITARY: оборонний бюджет, збройні сили, зброя, боєприпаси, військові технології, оборонна промисловість, військові закупівлі та дослідження. INTERNATIONAL: зовнішня політика, дипломатія, договори, санкції, міжнародні організації, відносини з іншими державами, міжнародна допомога, зовнішня торгівля та обмеження. ECONOMICS: федеральний бюджет і борг, податки, внутрішня економічна політика, банки, фінанси, енергетика, промисловість, праця та внутрішні ринки. OTHER: решта тем. Дозволено кілька категорій, якщо є реальний змістовний перетин. Не класифікуй як INTERNATIONAL лише через географічну назву або іноземне походження людини. Відповідай лише валідним JSON."""
+1. "title_uk" — точний переклад назви.
+2. "status_uk" — точний переклад статусу.
+3. "summary_uk" — коротке пояснення українською (1–2 речення). Якщо офіційне резюме відсутнє, не вигадуй деталей.
+4. "categories" — масив з однієї або кількох категорій: "MILITARY", "INTERNATIONAL", "ECONOMICS", "OTHER". MILITARY: оборонний бюджет, збройні сили, зброя, боєприпаси, військові технології, оборонна промисловість, військові закупівлі та дослідження. INTERNATIONAL: зовнішня політика, дипломатія, договори, санкції, міжнародні організації, відносини з іншими державами, міжнародна допомога, зовнішня торгівля та обмеження. ECONOMICS: федеральний бюджет і борг, податки, внутрішня економічна політика, банки, фінанси, енергетика, промисловість, праця та внутрішні ринки. OTHER: решта тем. Дозволено кілька категорій, якщо є реальний змістовний перетин. Не класифікуй як INTERNATIONAL лише через географічну назву або іноземне походження людини.
+Відповідай лише валідним JSON без Markdown."""
 
     url = "https://api.groq.com/openai/v1/chat/completions"
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
+    model_name = get_best_model()
 
     def call(use_json_mode):
         payload = {
             "model": model_name,
             "messages": [{"role": "user", "content": ai_prompt}],
             "temperature": 0.2,
+            "max_completion_tokens": 500,
         }
         if use_json_mode:
             payload["response_format"] = {"type": "json_object"}
-        return requests.post(url, headers=headers, json=payload, timeout=60)
+        return request_with_retry(
+            "POST", url, headers=headers, json=payload, timeout=60, retries=3
+        )
 
     try:
-        res = call(use_json_mode=True)
+        response = call(use_json_mode=True)
+        err_text = response.text.lower()
+        json_mode_unsupported = (
+            response.status_code == 400
+            and "response_format" in err_text
+            and ("not supported" in err_text or "unsupported" in err_text)
+        )
+        if json_mode_unsupported:
+            print(f"Модель {model_name} відхилила JSON mode; повторюю без нього.")
+            response = call(use_json_mode=False)
 
-        # Якщо саме ця модель не підтримує json-режим — пробуємо без нього
-        # і покладаємось на regex-парсер нижче.
-        if res.status_code == 400 and "json" in res.text.lower():
-            print(f"Модель {model_name} не підтримує JSON mode, пробую без нього...")
-            res = call(use_json_mode=False)
+        if response.status_code != 200:
+            try:
+                err = response.json().get("error", {})
+                message = err.get("message", response.text)
+            except (ValueError, AttributeError):
+                message = response.text
+            raise AIProcessingError(
+                f"Groq API повернув HTTP {response.status_code}: {str(message)[:300]}"
+            )
 
-        if res.status_code == 200:
-            data = res.json()["choices"][0]["message"]["content"]
-            match = re.search(r'\{[\s\S]*\}', data)
-            if match:
-                try:
-                    result = json.loads(match.group(0))
-                    valid_categories = {"MILITARY", "INTERNATIONAL", "ECONOMICS", "OTHER"}
-                    categories = result.get("categories", ["OTHER"])
-                    if not isinstance(categories, list):
-                        categories = ["OTHER"]
-                    categories = [x for x in categories if x in valid_categories]
-                    if not categories:
-                        categories = ["OTHER"]
-                    if "OTHER" in categories and len(categories) > 1:
-                        categories.remove("OTHER")
-                    return (
-                        result.get("title_uk", title),
-                        result.get("status_uk", status_en),
-                        result.get("summary_uk", "Опис відсутній."),
-                        categories
-                    )
-                except json.JSONDecodeError:
-                    pass
-            return title, status_en, title, ["OTHER"]
-        else:
-            err_msg = res.json().get('error', {}).get('message', res.text)
-            return title, status_en, f"Помилка API ({res.status_code}): {err_msg}", ["OTHER"]
+        body = response.json()
+        choices = body.get("choices") or []
+        if not choices:
+            raise AIProcessingError("Groq повернув відповідь без choices.")
+        content = choices[0].get("message", {}).get("content")
+        if not isinstance(content, str) or not content.strip():
+            raise AIProcessingError("Groq повернув порожню відповідь.")
 
-    except Exception as e:
-        return title, status_en, f"Збій з'єднання: {e}", ["OTHER"]
+        try:
+            result = json.loads(content)
+        except json.JSONDecodeError:
+            match = re.search(r"\{[\s\S]*\}", content)
+            if not match:
+                raise AIProcessingError("Groq повернув невалідний JSON.")
+            try:
+                result = json.loads(match.group(0))
+            except json.JSONDecodeError as exc:
+                raise AIProcessingError("Groq повернув невалідний JSON.") from exc
+
+        title_uk = result.get("title_uk")
+        status_uk = result.get("status_uk")
+        summary_uk = result.get("summary_uk")
+        if not all(isinstance(value, str) and value.strip() for value in
+                   (title_uk, status_uk, summary_uk)):
+            raise AIProcessingError("У JSON Groq немає всіх обов'язкових текстових полів.")
+
+        valid_categories = {"MILITARY", "INTERNATIONAL", "ECONOMICS", "OTHER"}
+        categories = result.get("categories", ["OTHER"])
+        if not isinstance(categories, list):
+            categories = ["OTHER"]
+        categories = [
+            item for item in categories
+            if isinstance(item, str) and item in valid_categories
+        ]
+        if not categories:
+            categories = ["OTHER"]
+        if "OTHER" in categories and len(categories) > 1:
+            categories.remove("OTHER")
+
+        usage = body.get("usage", {})
+        if usage:
+            print(
+                f"Groq usage: input={usage.get('prompt_tokens', 'n/a')}, "
+                f"output={usage.get('completion_tokens', 'n/a')}, "
+                f"total={usage.get('total_tokens', 'n/a')}."
+            )
+        return (
+            title_uk.strip(),
+            status_uk.strip(),
+            summary_uk.strip(),
+            list(dict.fromkeys(categories)),
+        )
+    except AIProcessingError:
+        raise
+    except requests.RequestException as exc:
+        raise AIProcessingError(f"Мережева помилка Groq: {exc}") from exc
+    except (ValueError, KeyError, TypeError) as exc:
+        raise AIProcessingError(f"Некоректна відповідь Groq: {exc}") from exc
 
 
 def get_public_url(congress, bill_type, number):
@@ -179,37 +273,61 @@ def get_bill_details(congress, b_type, number):
     summary_en = ""
     subjects = []
 
-    url = f"https://api.congress.gov/v3/bill/{congress}/{b_type.lower()}/{number}?api_key={API_KEY}"
-    res = requests.get(url, timeout=20)
-    if res.status_code == 200:
-        data = res.json().get("bill", {})
-        sponsors = data.get("sponsors", [])
-        if sponsors:
-            sponsor = sponsors[0].get("fullName", "Невідомо")
+    base_url = f"https://api.congress.gov/v3/bill/{congress}/{b_type.lower()}/{number}"
+    headers = {"X-API-Key": API_KEY}
+    response = request_with_retry(
+        "GET", base_url, params={"api_key": API_KEY}, headers=headers,
+        timeout=20, retries=2
+    )
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Congress.gov не повернув документ {congress}/{b_type}/{number}: "
+            f"HTTP {response.status_code}."
+        )
 
-        action = data.get("latestAction", {}).get("text", "")
-        if action:
-            status_en = action
+    data = response.json().get("bill", {})
+    sponsors = data.get("sponsors", [])
+    if sponsors:
+        sponsor = sponsors[0].get("fullName", "Невідомо")
+    action = data.get("latestAction", {}).get("text", "")
+    if action:
+        status_en = action
 
-    url_sum = f"https://api.congress.gov/v3/bill/{congress}/{b_type.lower()}/{number}/summaries?api_key={API_KEY}"
-    res_sum = requests.get(url_sum, timeout=20)
-    if res_sum.status_code == 200:
-        summaries = res_sum.json().get("summaries", [])
+    summary_response = request_with_retry(
+        "GET", f"{base_url}/summaries", params={"api_key": API_KEY}, headers=headers,
+        timeout=20, retries=2
+    )
+    if summary_response.status_code == 200:
+        summaries = summary_response.json().get("summaries", [])
         if summaries:
             summary_en = summaries[0].get("text", "")
-            summary_en = re.sub(r'<[^>]+>', '', summary_en)
+            summary_en = re.sub(r"<[^>]+>", " ", summary_en)
+            summary_en = " ".join(summary_en.split())
+    elif summary_response.status_code != 404:
+        raise RuntimeError(
+            f"Congress.gov не повернув резюме {congress}/{b_type}/{number}: "
+            f"HTTP {summary_response.status_code}."
+        )
 
-    url_subjects = f"https://api.congress.gov/v3/bill/{congress}/{b_type.lower()}/{number}/subjects?api_key={API_KEY}"
-    try:
-        res_subjects = requests.get(url_subjects, timeout=15)
-        if res_subjects.status_code == 200:
-            subject_data = res_subjects.json().get("subjects", {})
-            subjects = [x.get("name", "") for x in subject_data.get("legislativeSubjects", []) if x.get("name")]
-            policy_area = subject_data.get("policyArea", {})
-            if isinstance(policy_area, dict) and policy_area.get("name"):
-                subjects.append(policy_area["name"])
-    except Exception as e:
-        print(f"Не вдалося отримати теми для {congress}/{b_type}/{number}: {e}")
+    subjects_response = request_with_retry(
+        "GET", f"{base_url}/subjects", params={"api_key": API_KEY}, headers=headers,
+        timeout=15, retries=2
+    )
+    if subjects_response.status_code == 200:
+        subject_data = subjects_response.json().get("subjects", {})
+        subjects = [
+            item.get("name", "")
+            for item in subject_data.get("legislativeSubjects", [])
+            if item.get("name")
+        ]
+        policy_area = subject_data.get("policyArea", {})
+        if isinstance(policy_area, dict) and policy_area.get("name"):
+            subjects.append(policy_area["name"])
+    elif subjects_response.status_code != 404:
+        print(
+            f"Не вдалося отримати теми {congress}/{b_type}/{number}: "
+            f"HTTP {subjects_response.status_code}."
+        )
 
     return sponsor, status_en, summary_en, subjects
 
@@ -222,32 +340,68 @@ def category_labels(categories):
 def load_processed():
     if os.path.exists(STATE_FILE):
         try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return []
+            with open(STATE_FILE, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            return data if isinstance(data, list) else []
+        except (OSError, ValueError) as exc:
+            print(f"Не вдалося прочитати {STATE_FILE}: {exc}.")
     return []
 
 
 def save_processed(processed):
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(list(dict.fromkeys(processed)), f, ensure_ascii=False, indent=2)
+    temporary_path = f"{STATE_FILE}.tmp"
+    with open(temporary_path, "w", encoding="utf-8") as handle:
+        json.dump(list(dict.fromkeys(processed)), handle, ensure_ascii=False, indent=2)
+    os.replace(temporary_path, STATE_FILE)
+
+
+def load_processed_actions():
+    default_state = {"version": 1, "actions": [], "tracked_bills": []}
+    if not os.path.exists(ACTION_STATE_FILE):
+        return default_state
+    try:
+        with open(ACTION_STATE_FILE, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if not isinstance(data, dict):
+            raise ValueError("очікувався JSON-об'єкт")
+        return {
+            "version": 1,
+            "actions": data.get("actions", []) if isinstance(data.get("actions"), list) else [],
+            "tracked_bills": data.get("tracked_bills", [])
+            if isinstance(data.get("tracked_bills"), list) else [],
+        }
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"Не вдалося прочитати {ACTION_STATE_FILE}; зупиняюся, щоб не створити дублікати: {exc}"
+        ) from exc
+
+
+def save_processed_actions(actions, tracked_bills):
+    state = {
+        "version": 1,
+        "actions": list(dict.fromkeys(actions))[-20000:],
+        "tracked_bills": sorted(set(tracked_bills)),
+    }
+    temporary_path = f"{ACTION_STATE_FILE}.tmp"
+    with open(temporary_path, "w", encoding="utf-8") as handle:
+        json.dump(state, handle, ensure_ascii=False, indent=2)
+    os.replace(temporary_path, ACTION_STATE_FILE)
 
 
 def parse_update_date(bill):
-    """Повертає дату оновлення в UTC або None, якщо дата відсутня/некоректна."""
     value = bill.get("updateDate")
     if not value:
         return None
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
     except (TypeError, ValueError):
         return None
 
 
 def get_activity_date_raw(bill):
-    """Повертає дату останньої законодавчої дії; для нових записів — дату внесення."""
     latest_action = bill.get("latestAction")
     if isinstance(latest_action, dict):
         value = latest_action.get("actionDate")
@@ -257,15 +411,44 @@ def get_activity_date_raw(bill):
 
 
 def parse_activity_date(bill):
-    """Повертає дату останньої законодавчої дії/внесення в UTC, а не дату синхронізації API."""
     value = get_activity_date_raw(bill)
     if not value:
         return None
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-        return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
     except (TypeError, ValueError):
         return None
+
+
+def is_recent_activity(bill, now=None):
+    """Строго відсікає дії старші за 24 години та дати з майбутнього.
+
+    Для actionDate у форматі YYYY-MM-DD час відсутній. Щоб не видавати старі
+    документи як нові, такі записи приймаються лише за поточну UTC-дату.
+    """
+    now = now or datetime.now(timezone.utc)
+    raw_value = get_activity_date_raw(bill)
+    activity_date = parse_activity_date(bill)
+    if activity_date is None or activity_date > now:
+        return False
+    if len(raw_value) <= 10:
+        return activity_date.date() == now.date()
+    return activity_date >= now - timedelta(hours=24)
+
+
+def get_action_fingerprint(bill):
+    """Хешує конкретну дію; один законопроєкт може мати кілька різних дій."""
+    bill_id = f"{bill.get('congress')}_{bill.get('type')}_{bill.get('number')}"
+    latest_action = bill.get("latestAction")
+    action_text = latest_action.get("text", "") if isinstance(latest_action, dict) else ""
+    normalized_action = " ".join(
+        unicodedata.normalize("NFKC", str(action_text)).casefold().split()
+    ) or "introduced"
+    raw_key = f"{bill_id}|{get_activity_date_raw(bill)}|{normalized_action}"
+    return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
 
 
 def fetch_recent_bills():
@@ -276,25 +459,22 @@ def fetch_recent_bills():
     url = f"https://api.congress.gov/v3/bill/{current_congress}"
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=24)
-
-    # Congress.gov документує fromDateTime/toDateTime для фільтрації за updateDate.
-    # Відступ на добу потрібен, бо частина відповідей може містити updateDate
-    # лише як YYYY-MM-DD, без часу, інакше можна втратити записи на межі доби.
     api_from = (cutoff - timedelta(days=1)).replace(
         hour=0, minute=0, second=0, microsecond=0
     )
+
     recent_bills = []
     seen_ids = set()
-    stale_activity_count = 0
-    missing_activity_date_count = 0
+    stale_count = 0
+    missing_activity_count = 0
+    invalid_update_count = 0
     limit = 250
     offset = 0
     page = 0
 
     print(
-        f"Congress.gov: скликання {current_congress}; "
-        f"шукаємо документи після {cutoff.isoformat()} "
-        f"(API-вікно від {api_from.isoformat()} до {now.isoformat()})."
+        f"Congress.gov: скликання {current_congress}; відбір законодавчих дій "
+        f"за останні 24 години до {now.isoformat()}."
     )
 
     while True:
@@ -306,133 +486,101 @@ def fetch_recent_bills():
             "toDateTime": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
             "sort": "updateDate+desc",
         }
-
-        try:
-            response = requests.get(url, params=params, timeout=30)
-        except requests.RequestException as exc:
-            raise RuntimeError(f"Помилка з'єднання з Congress.gov API: {exc}") from exc
-
+        response = request_with_retry("GET", url, params=params, timeout=30, retries=3)
         if response.status_code != 200:
-            excerpt = response.text[:500].replace("\\n", " ")
+            excerpt = response.text[:300].replace("\n", " ")
             raise RuntimeError(
                 f"Congress.gov API повернув HTTP {response.status_code}: {excerpt}"
             )
 
-        payload = response.json()
-        bills = payload.get("bills", [])
+        bills = response.json().get("bills", [])
         page += 1
         print(
             f"Congress.gov сторінка {page} (offset={offset}): "
-            f"HTTP {response.status_code}; отримано документів: {len(bills)}."
+            f"отримано документів={len(bills)}."
         )
-
         if not bills:
             break
 
         page_dates = [parse_update_date(bill) for bill in bills]
-        valid_dates = [value for value in page_dates if value is not None]
-        if valid_dates:
-            print(
-                f"Діапазон updateDate на сторінці {page}: "
-                f"{min(valid_dates).isoformat()} — {max(valid_dates).isoformat()}; "
-                f"дат без розпізнавання: {len(bills) - len(valid_dates)}."
-            )
-        else:
-            print(
-                f"Увага: на сторінці {page} немає жодної розпізнаної updateDate."
-            )
-
-        for bill, bill_date in zip(bills, page_dates):
-            raw_date = str(bill.get("updateDate", "")).strip()
-            if bill_date is None:
-                print(
-                    "Пропущено запис без коректної updateDate: "
-                    f"{bill.get('congress')}_{bill.get('type')}_{bill.get('number')}"
-                )
+        for bill, update_date in zip(bills, page_dates):
+            raw_update = str(bill.get("updateDate", "")).strip()
+            if update_date is None:
+                invalid_update_count += 1
                 continue
-
-            # Якщо API повернув повний timestamp, фільтруємо точно за 24 годинами.
-            # Якщо повернулася лише календарна дата, точний час невідомий, тому
-            # беремо попередню календарну дату як захисний запас від пропусків.
-            if len(raw_date) <= 10:
-                if bill_date.date() < cutoff.date():
+            # API-вікно ширше за 24 години; фактичну свіжість визначає actionDate нижче.
+            if len(raw_update) <= 10:
+                if update_date.date() < api_from.date():
                     continue
-            elif bill_date < cutoff:
+            elif update_date < api_from or update_date > now + timedelta(minutes=5):
                 continue
 
-            # updateDate може змінитися через синхронізацію метаданих, навіть коли
-            # законопроєкт не мав нової законодавчої дії. Відбираємо за actionDate.
             activity_raw = get_activity_date_raw(bill)
-            activity_date = parse_activity_date(bill)
-            if activity_date is None:
-                missing_activity_date_count += 1
+            if not activity_raw:
+                missing_activity_count += 1
+                continue
+            if not is_recent_activity(bill, now):
+                stale_count += 1
                 continue
 
-            if len(activity_raw) <= 10:
-                # Для дат без часу приймаємо лише сьогоднішню UTC-дату.
-                if activity_date.date() < cutoff.date():
-                    stale_activity_count += 1
-                    continue
-            elif activity_date < cutoff:
-                stale_activity_count += 1
-                continue
-
-            bill_id = (
-                f"{bill.get('congress')}_{bill.get('type')}_{bill.get('number')}"
-            )
+            bill_id = f"{bill.get('congress')}_{bill.get('type')}_{bill.get('number')}"
             if bill_id not in seen_ids:
                 recent_bills.append(bill)
                 seen_ids.add(bill_id)
 
-        # Не зупиняємося за мінімальною датою сторінки: пагінація продовжується,
-        # доки API повертає записи в межах запитаного діапазону.
         if len(bills) < limit:
             break
         offset += limit
 
-    # Захисне сортування на стороні клієнта, незалежно від порядку API.
     recent_bills.sort(
-        key=lambda bill: parse_activity_date(bill) or datetime.min.replace(tzinfo=timezone.utc),
+        key=lambda bill: parse_activity_date(bill)
+        or datetime.min.replace(tzinfo=timezone.utc),
         reverse=True,
     )
-
     print(
-        f"Congress.gov: знайдено документів із новою законодавчою дією: {len(recent_bills)}; "
-        f"відсіяно зі старою дією: {stale_activity_count}; "
-        f"без коректної дати дії/внесення: {missing_activity_date_count}."
+        f"Congress.gov: свіжих дій={len(recent_bills)}; "
+        f"відсіяно старих/непідтверджених={stale_count}; "
+        f"без дати дії={missing_activity_count}; "
+        f"без коректної updateDate={invalid_update_count}."
     )
     if not recent_bills:
-        print(
-            "У заданому часовому вікні документів не знайдено. "
-            "Перевір параметри fromDateTime/toDateTime, сортування та API-відповідь."
-        )
-
+        print("За суворим правилом останніх 24 годин законодавчих дій не знайдено.")
     return recent_bills
 
-def send_telegram(text):
+
+def send_telegram(message_text):
     if not TOKEN or not CHAT_ID:
         raise RuntimeError("Не задано TELEGRAM_BOT_TOKEN або TELEGRAM_CHAT_ID.")
 
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    try:
-        response = requests.post(url, json={
+    # Не повторюємо POST після мережевого exception: невідомо, чи Telegram уже
+    # прийняв повідомлення. HTTP-відповіді 429/5xx безпечно обробляємо retry.
+    response = request_with_retry(
+        "POST",
+        url,
+        json={
             "chat_id": CHAT_ID,
-            "text": text,
+            "text": message_text,
             "parse_mode": "HTML",
-            "disable_web_page_preview": True
-        }, timeout=20)
-    except requests.RequestException as exc:
-        raise RuntimeError(f"Помилка з'єднання з Telegram API: {exc}") from exc
-
+            "disable_web_page_preview": True,
+        },
+        timeout=20,
+        retries=2,
+        retry_connection_errors=False,
+    )
     try:
         result = response.json()
     except ValueError:
         result = {}
 
     if response.status_code != 200 or not result.get("ok"):
-        description = result.get("description", response.text[:500])
-        raise RuntimeError(f"Telegram API не підтвердив публікацію (HTTP {response.status_code}): {description}")
+        description = result.get("description", response.text[:300])
+        raise RuntimeError(
+            f"Telegram API не підтвердив публікацію "
+            f"(HTTP {response.status_code}): {description}"
+        )
     return True
+
 
 
 if __name__ == "__main__":
@@ -442,75 +590,117 @@ if __name__ == "__main__":
         raise RuntimeError("Відсутній CONGRESS_API_KEY.")
 
     processed = load_processed()
-    print(f"У базі вже оброблених документів: {len(processed)}.")
+    action_state = load_processed_actions()
+    processed_actions = set(action_state["actions"])
+    tracked_bills = set(action_state["tracked_bills"])
+    print(f"Legacy ID документів: {len(processed)}.")
+    print(f"Fingerprint законодавчих дій: {len(processed_actions)}.")
+
     recent_bills = fetch_recent_bills()
     sent_count = 0
     already_processed = 0
+    legacy_baselined = 0
     technical_count = 0
     failed_count = 0
 
     for bill in recent_bills:
         bill_id = f"{bill['congress']}_{bill['type']}_{bill['number']}"
+        action_key = get_action_fingerprint(bill)
 
-        if bill_id in processed:
+        if action_key in processed_actions:
             already_processed += 1
-            print(
-                f"УЖЕ ОБРОБЛЕНО: {bill_id} | "
-                f"оновлено={bill.get('updateDate', 'невідомо')} | "
-                f"title={bill.get('title', '')}"
-            )
+            print(f"УЖЕ ОПУБЛІКОВАНА ЦЯ ДІЯ: {bill_id}")
             continue
 
-        if is_technical(bill.get("title", "")) or is_technical(bill.get("latestAction", {}).get("text", "")):
+        # Разово базуємо старі ID, щоб не повторити пости після оновлення.
+        # Наступна дія цього документа матиме інший fingerprint і буде опублікована.
+        if bill_id in processed and bill_id not in tracked_bills:
+            processed_actions.add(action_key)
+            tracked_bills.add(bill_id)
+            legacy_baselined += 1
+            print(f"Створено початковий fingerprint старого документа: {bill_id}")
+            continue
+
+        title_en = bill.get("title", "")
+        latest_action = bill.get("latestAction", {})
+        latest_action_text = (
+            latest_action.get("text", "") if isinstance(latest_action, dict) else ""
+        )
+        if is_technical(title_en) or is_technical(latest_action_text):
             technical_count += 1
-            print(f"Пропущено як технічний документ: {bill_id} | {bill.get('title', '')}")
-            processed.append(bill_id)
+            processed_actions.add(action_key)
+            tracked_bills.add(bill_id)
+            if bill_id not in processed:
+                processed.append(bill_id)
+            print(f"Пропущено як технічний документ: {bill_id} | {title_en}")
             continue
 
-        print(f"Обробка закону: {bill_id} | оновлено: {bill.get('updateDate', 'невідомо')}")
-
+        print(
+            f"Обробка свіжої законодавчої дії: {bill_id}; "
+            f"actionDate={get_activity_date_raw(bill)}"
+        )
         try:
             sponsor, status_en, summary_en, subjects = get_bill_details(
                 bill["congress"], bill["type"], bill["number"]
             )
+            # process_with_ai кидає помилку; вона ніколи не піде в текст новини.
             title_uk, status_uk, desc_uk, categories = process_with_ai(
-                bill["title"], status_en, summary_en, subjects
+                title_en, status_en, summary_en, subjects
             )
-
-            public_url = get_public_url(bill["congress"], bill["type"], bill["number"])
+            public_url = get_public_url(
+                bill["congress"], bill["type"], bill["number"]
+            )
             categories_text = category_labels(categories)
-            message = (
-                f"🇺🇸 <b>Конгрес США ({bill['congress']}-е скликання)</b>\n\n"
-                f"📌 <b>{bill['type'].upper()} {bill['number']}</b>\n"
-                f"<b>{escape_html(title_uk)}</b>\n"
-                f"🏷 <b>Категорії:</b> {escape_html(categories_text)}\n"
-                f"📅 <b>Остання законодавча дія:</b> {escape_html(get_activity_date_raw(bill) or 'невідомо')}\n\n"
-                f"👤 <b>Ініціатор:</b> {escape_html(sponsor)}\n"
-                f"📜 <b>Статус:</b> {escape_html(status_uk)}\n\n"
-                f"💡 <b>Суть:</b> {escape_html(desc_uk)}\n\n"
-                f"🔗 <a href='{public_url}'>Оригінал документа</a>"
-            )
+            action_date = get_activity_date_raw(bill) or "невідомо"
+            introduced_date = str(bill.get("introducedDate") or "").strip()
 
-            send_telegram(message)
-            # Фіксуємо ID лише після підтвердження успішної публікації.
-            processed.append(bill_id)
+            message_lines = [
+                f"🇺🇸 <b>Конгрес США ({bill['congress']}-е скликання)</b>",
+                "",
+                f"📌 <b>{bill['type'].upper()} {bill['number']}</b>",
+                f"<b>{escape_html(title_uk)}</b>",
+                f"🏷 <b>Категорії:</b> {escape_html(categories_text)}",
+                f"📅 <b>Дата законодавчої дії:</b> {escape_html(action_date)}",
+            ]
+            if introduced_date and introduced_date != action_date:
+                message_lines.append(
+                    f"🗂 <b>Дата внесення:</b> {escape_html(introduced_date)}"
+                )
+            message_lines.extend([
+                "",
+                f"👤 <b>Ініціатор:</b> {escape_html(sponsor)}",
+                f"📜 <b>Статус / дія:</b> {escape_html(status_uk)}",
+                "",
+                f"💡 <b>Суть:</b> {escape_html(desc_uk)}",
+                "",
+                f"🔗 <a href='{public_url}'>Оригінал документа</a>",
+            ])
+            send_telegram("\n".join(message_lines))
+
+            # Зберігаємо fingerprint тільки після підтвердженої публікації.
+            processed_actions.add(action_key)
+            tracked_bills.add(bill_id)
+            if bill_id not in processed:
+                processed.append(bill_id)
             sent_count += 1
             print(f"Telegram підтвердив публікацію: {bill_id}")
             time.sleep(3)
         except Exception as exc:
             failed_count += 1
-            print(f"ПОМИЛКА для {bill_id}: {exc}")
-            # Невдалий документ не потрапляє до processed і може бути повторений.
+            print(f"ПОМИЛКА для {bill_id}; дія залишена для повторної спроби: {exc}")
             continue
 
     save_processed(processed)
+    save_processed_actions(processed_actions, tracked_bills)
     print(
         "ПІДСУМОК: "
-        f"знайдено={len(recent_bills)}; "
-        f"вже оброблено={already_processed}; "
-        f"технічні пропуски={technical_count}; "
-        f"успішно опубліковано={sent_count}; "
-        f"помилки={failed_count}."
+        f"свіжих дій={len(recent_bills)}; "
+        f"повторів/старих fingerprints={already_processed}; "
+        f"базових fingerprints legacy={legacy_baselined}; "
+        f"технічних пропусків={technical_count}; "
+        f"успішних публікацій={sent_count}; помилок={failed_count}."
     )
     if failed_count:
-        raise RuntimeError(f"Не вдалося обробити/опублікувати {failed_count} документ(ів); див. журнал вище.")
+        raise RuntimeError(
+            f"Не вдалося обробити/опублікувати {failed_count} документ(ів); див. журнал вище."
+        )
