@@ -443,10 +443,11 @@ def parse_activity_date(bill):
 
 
 def is_recent_activity(bill, now=None):
-    """Строго відсікає дії старші за 24 години та дати з майбутнього.
+    """Консервативно відсікає дії, старші за 24 години, та майбутні дати.
 
-    Для actionDate у форматі YYYY-MM-DD час відсутній. Щоб не видавати старі
-    документи як нові, такі записи приймаються лише за поточну UTC-дату.
+    Для actionDate у форматі YYYY-MM-DD час відсутній. Неможливо довести,
+    що дата вчорашнього дня потрапляє в рухоме 24-годинне вікно, тому такі
+    записи пропускаються. Це свідомий компроміс на користь відсутності старих новин.
     """
     now = now or datetime.now(timezone.utc)
     raw_value = get_activity_date_raw(bill)
@@ -454,10 +455,7 @@ def is_recent_activity(bill, now=None):
     if activity_date is None or activity_date > now:
         return False
     if len(raw_value) <= 10:
-        # API does not expose a time here. Use the cutoff's UTC calendar date
-        # as a documented fallback; the action date still blocks 2025/older records.
-        cutoff_date = (now - timedelta(hours=24)).date()
-        return cutoff_date <= activity_date.date() <= now.date()
+        return activity_date.date() == now.date()
     return now - timedelta(hours=24) <= activity_date <= now
 
 
